@@ -1,0 +1,7 @@
+.git
+.gitignore
+*.exe
+devhub.exe
+*.log
+.system_generated
+scratch

@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  devhub:
+    image: devhub:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: devhub-mesh
+    ports:
+      - "4000:4000" # L7 Ingress Gateway & Forward Proxy
+      - "4040:4040" # Developer Cockpit & Live Telemetry
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - .:/workspace:ro
+    environment:
+      - PORT=4000
+      - DASHBOARD=4040
+    restart: unless-stopped

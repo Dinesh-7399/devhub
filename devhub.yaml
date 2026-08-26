@@ -1,0 +1,45 @@
+# ==============================================================================
+#                      DEVHUB CORE DAEMON CONFIGURATION
+# ==============================================================================
+
+server:
+  proxy_port: 4000
+  dashboard_port: 4040
+  host: "0.0.0.0"
+
+# Phase 2: Docker Engine Auto-Discovery
+docker:
+  enabled: true
+  poll_logs: true
+
+# Phase 4: Public Ingress Tunnel (Optional)
+tunnel:
+  enabled: false
+  server_url: "wss://relay.devhub.live/tunnel"
+  subdomain: ""
+
+# Phase 5: Distributed Tracing & PII Protection
+tracing:
+  enabled: true
+  redact_pii: true
+  ring_size: 500
+
+# Static Routes (Supplemented dynamically by Docker container discovery)
+routes:
+  - prefix: "/auth"
+    target: "http://localhost:5001"
+    strip_prefix: false
+    health_check_path: "/health"
+    timeout_ms: 5000
+
+  - prefix: "/api/v1"
+    target: "http://localhost:5002"
+    strip_prefix: true
+    health_check_path: "/health"
+    timeout_ms: 10000
+
+  - prefix: "/"
+    target: "http://localhost:3000"
+    strip_prefix: false
+    health_check_path: "/"
+    timeout_ms: 5000

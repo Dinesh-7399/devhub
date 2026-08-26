@@ -1,0 +1,30 @@
+# Binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+devhub
+devhub.exe
+
+# Test binaries
+*.test
+
+# Go workspace & caches
+.cache/
+vendor/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and scratch
+*.log
+scratch/
+.system_generated/
