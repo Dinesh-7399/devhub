@@ -3,7 +3,7 @@
 # ==============================================================================
 
 # Build Stage
-FROM golang:1.24-alpine AS builder
+FROM golang:alpine AS builder
 
 WORKDIR /app
 
@@ -21,7 +21,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/devhub ./cmd/main.go
 
 # Runtime Stage (Minimal Alpine ~15MB)
-FROM alpine:3.20
+FROM alpine:latest
 
 RUN apk add --no-cache ca-certificates tzdata curl
 
