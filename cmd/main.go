@@ -443,14 +443,14 @@ func printHeaderBanner(cfg *config.Config) {
 	fmt.Printf("%s%s  │  ╚═════╝ ╚══════╝  ╚═══╝  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝                     │%s\n", colBold, colPurple, colReset)
 	fmt.Printf("%s%s  └────────────────────────────────────────────────────────────────────────┘%s\n", colBold, colCyan, colReset)
 	fmt.Println()
-	fmt.Printf("  %s• Ingress Gateway%s   : %s%shttp://localhost:%d%s\n", colBold, colReset, colBold+colCyan, "http://localhost:", cfg.Server.ProxyPort, colReset)
-	fmt.Printf("  %s• Developer Cockpit%s : %s%shttp://localhost:%d%s\n", colBold, colReset, colBold+colEmerald, "http://localhost:", cfg.Server.DashboardPort, colReset)
-	fmt.Printf("  %s• WebSocket Stream%s  : %s%sws://localhost:%d/ws%s\n", colBold, colReset, colBold+colPurple, "ws://localhost:", cfg.Server.DashboardPort, colReset)
+	fmt.Printf("  %s• Ingress Gateway%s   : %shttp://localhost:%d%s\n", colBold, colReset, colBold+colCyan, cfg.Server.ProxyPort, colReset)
+	fmt.Printf("  %s• Developer Cockpit%s : %shttp://localhost:%d%s\n", colBold, colReset, colBold+colEmerald, cfg.Server.DashboardPort, colReset)
+	fmt.Printf("  %s• WebSocket Stream%s  : %sws://localhost:%d/ws%s\n", colBold, colReset, colBold+colPurple, cfg.Server.DashboardPort, colReset)
 	if cfg.Docker.Enabled {
-		fmt.Printf("  %s• Docker Discovery%s  : %s%sActive (listening on IPC socket)%s\n", colBold, colReset, colSky, "Active", colReset)
+		fmt.Printf("  %s• Docker Discovery%s  : %sActive (listening on IPC socket)%s\n", colBold, colReset, colSky, colReset)
 	}
-	fmt.Printf("  %s• Forward Proxy%s     : %s%sHTTP_PROXY=http://localhost:%d%s %s(Zero-Code Cascades)%s\n",
-		colBold, colReset, colYellow, "http://localhost:", cfg.Server.ProxyPort, colReset, colGray, colReset)
+	fmt.Printf("  %s• Forward Proxy%s     : %sHTTP_PROXY=http://localhost:%d%s %s(Zero-Code Cascades)%s\n",
+		colBold, colReset, colYellow, cfg.Server.ProxyPort, colReset, colGray, colReset)
 
 	fmt.Println()
 	fmt.Printf("%s┌─── Active Mesh Route Table ──────────────────────────────────────────────┐%s\n", colDarkGray, colReset)
