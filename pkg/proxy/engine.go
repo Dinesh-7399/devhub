@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -84,6 +85,7 @@ type Engine struct {
 	HTTPProxy *httputil.ReverseProxy
 	Transport http.RoundTripper
 	RedactPII bool
+	eventQ    chan buffer.TraceEvent
 }
 
 // NewEngine initializes a high-performance streaming reverse and forward proxy engine.
@@ -116,7 +118,9 @@ func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffe
 		Broadcast: broadcaster,
 		Transport: transport,
 		RedactPII: true,
+		eventQ:    make(chan buffer.TraceEvent, 2048),
 	}
+	go e.processEvents()
 
 	e.HTTPProxy = &httputil.ReverseProxy{
 		Transport: transport,
@@ -204,12 +208,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				RespHeaders:  mockRule.Headers,
 				ResponseBody: mockRule.Body,
 			}
-			if e.Ring != nil {
-				e.Ring.Push(event)
-			}
-			if e.Broadcast != nil {
-				e.Broadcast(event)
-			}
+			e.enqueueEvent(event)
 			return
 		}
 	}
@@ -220,13 +219,19 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if route.Timeout > 0 {
+		reqCtx, cancel := context.WithTimeout(req.Context(), route.Timeout)
+		defer cancel()
+		req = req.WithContext(reqCtx)
+	}
+
 	// 4. Transparent WebSocket Upgrade Interception
 	if isWebSocketRequest(req) {
 		e.proxyWebSocket(w, req, route.Target, outboundPath, start)
 		return
 	}
 
-	// 5. Active circuit breaker check
+	// 5. Optional health enforcement check
 	if e.Health != nil && !e.Health.IsHealthy(route.Target) {
 		// If mock fallback exists on error
 		if e.Mocks != nil {
@@ -321,12 +326,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Recycle response capturer
 	capturerPool.Put(rw)
 
-	if e.Ring != nil {
-		e.Ring.Push(event)
-	}
-	if e.Broadcast != nil {
-		e.Broadcast(event)
-	}
+	e.enqueueEvent(event)
 }
 
 // handleForwardProxyHTTP handles HTTP requests made via HTTP_PROXY environment variables (Service A -> Service B).
@@ -340,12 +340,11 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 	}
 	req.Header.Set("X-DevHub-Egress", "true")
 
-	// Read body for inspection
-	var reqBodyStr string
+	var reqCap *captureBuffer
 	if req.Body != nil && req.Body != http.NoBody {
-		bodyBytes, _ := io.ReadAll(req.Body)
-		reqBodyStr = string(bodyBytes)
-		req.Body = io.NopCloser(strings.NewReader(reqBodyStr))
+		reqCap = capturePool.Get().(*captureBuffer)
+		reqCap.reset()
+		req.Body = &bodySniffer{reader: req.Body, capture: reqCap}
 	}
 
 	outboundReq, err := http.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), req.Body)
@@ -364,16 +363,24 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 	}
 	defer resp.Body.Close()
 
-	respBytes, _ := io.ReadAll(resp.Body)
-	duration := time.Since(start).Milliseconds()
-
 	for k, v := range resp.Header {
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-	w.Write(respBytes)
+	rw := capturerPool.Get().(*responseCapturer)
+	rw.reset(w)
+	rw.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(rw, resp.Body)
+	duration := time.Since(start).Milliseconds()
+
+	var reqBodyStr string
+	if reqCap != nil {
+		reqBodyStr = reqCap.string()
+		capturePool.Put(reqCap)
+	}
+	respBodyStr := rw.string()
+	capturerPool.Put(rw)
 
 	event := buffer.TraceEvent{
 		ID:           fastTraceID(),
@@ -387,14 +394,9 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 		ReqHeaders:   extractHeaders(req.Header),
 		RespHeaders:  extractHeaders(resp.Header),
 		RequestBody:  reqBodyStr,
-		ResponseBody: string(respBytes),
+		ResponseBody: respBodyStr,
 	}
-	if e.Ring != nil {
-		e.Ring.Push(event)
-	}
-	if e.Broadcast != nil {
-		e.Broadcast(event)
-	}
+	e.enqueueEvent(event)
 }
 
 // handleConnectTunnel handles HTTPS/TLS CONNECT forward proxy tunnels.
@@ -437,12 +439,7 @@ func (e *Engine) handleConnectTunnel(w http.ResponseWriter, req *http.Request, s
 		ReqHeaders:  extractHeaders(req.Header),
 		RespHeaders: map[string]string{"Proxy-Agent": "DevHub"},
 	}
-	if e.Ring != nil {
-		e.Ring.Push(event)
-	}
-	if e.Broadcast != nil {
-		e.Broadcast(event)
-	}
+	e.enqueueEvent(event)
 
 	// Full-duplex pipe
 	errc := make(chan error, 2)
@@ -509,12 +506,7 @@ func (e *Engine) proxyWebSocket(w http.ResponseWriter, req *http.Request, target
 		ReqHeaders:  extractHeaders(req.Header),
 		RespHeaders: map[string]string{"Upgrade": "websocket", "Connection": "Upgrade"},
 	}
-	if e.Ring != nil {
-		e.Ring.Push(event)
-	}
-	if e.Broadcast != nil {
-		e.Broadcast(event)
-	}
+	e.enqueueEvent(event)
 
 	// Bidirectional full-duplex copy
 	errc := make(chan error, 2)
@@ -649,6 +641,33 @@ func cryptoID(n int) string {
 func extractHeaders(h http.Header) map[string]string {
 	if len(h) == 0 {
 		return nil
+	}
+
+	func (e *Engine) enqueueEvent(event buffer.TraceEvent) {
+		if e == nil {
+			return
+		}
+		select {
+		case e.eventQ <- event:
+		default:
+		}
+	}
+
+	func (e *Engine) processEvents() {
+		for event := range e.eventQ {
+			if e.RedactPII {
+				event.ReqHeaders = tracing.RedactHeaders(event.ReqHeaders)
+				event.RespHeaders = tracing.RedactHeaders(event.RespHeaders)
+				event.RequestBody = tracing.RedactBody(event.RequestBody)
+				event.ResponseBody = tracing.RedactBody(event.ResponseBody)
+			}
+			if e.Ring != nil {
+				e.Ring.Push(event)
+			}
+			if e.Broadcast != nil {
+				e.Broadcast(event)
+			}
+		}
 	}
 	out := make(map[string]string, len(h))
 	for k, v := range h {

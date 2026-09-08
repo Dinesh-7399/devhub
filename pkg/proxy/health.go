@@ -9,12 +9,22 @@ import (
 	"time"
 )
 
+type HealthState string
+
+const (
+	HealthUnknown   HealthState = "UNKNOWN"
+	HealthHealthy   HealthState = "HEALTHY"
+	HealthDegraded  HealthState = "DEGRADED"
+	HealthUnhealthy HealthState = "UNHEALTHY"
+)
+
 // TargetHealth tracks the health status of an upstream microservice.
 type TargetHealth struct {
 	Name             string    `json:"name"`
 	URL              string    `json:"url"`
 	Host             string    `json:"host"`
 	Healthy          bool      `json:"healthy"`
+	State            HealthState `json:"state"`
 	ConsecutiveFails int       `json:"consecutive_fails"`
 	LastChecked      time.Time `json:"last_checked"`
 	LatencyMs        int64     `json:"latency_ms"`
@@ -27,6 +37,7 @@ type HealthMonitor struct {
 	targets        map[string]*TargetHealth
 	client         *http.Client
 	onStatusChange func(th TargetHealth)
+	enforce        bool
 }
 
 // NewHealthMonitor initializes an upstream health monitor.
@@ -64,9 +75,16 @@ func (h *HealthMonitor) RegisterTarget(u *url.URL, healthPath string) {
 			URL:        u.String(),
 			Host:       u.Host,
 			Healthy:    true,
+			State:      HealthUnknown,
 			HealthPath: healthPath,
 		}
 	}
+}
+
+func (h *HealthMonitor) SetEnforcement(enforce bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.enforce = enforce
 }
 
 // IsHealthy returns whether a target URL is considered available.
@@ -78,6 +96,9 @@ func (h *HealthMonitor) IsHealthy(u *url.URL) bool {
 	defer h.mu.RUnlock()
 
 	if target, exists := h.targets[u.String()]; exists {
+		if !h.enforce {
+			return true
+		}
 		return target.Healthy
 	}
 	return true // Default to healthy if unmonitored
@@ -95,6 +116,7 @@ func (h *HealthMonitor) RecordSuccess(u *url.URL) {
 		wasUnhealthy := !target.Healthy
 		target.ConsecutiveFails = 0
 		target.Healthy = true
+		target.State = HealthHealthy
 		target.LastChecked = time.Now()
 		if wasUnhealthy && h.onStatusChange != nil {
 			go h.onStatusChange(*target)
@@ -116,9 +138,12 @@ func (h *HealthMonitor) RecordFailure(u *url.URL) {
 		target.LastChecked = time.Now()
 		if target.ConsecutiveFails >= 3 {
 			target.Healthy = false
+			target.State = HealthUnhealthy
 			if wasHealthy && h.onStatusChange != nil {
 				go h.onStatusChange(*target)
 			}
+		} else {
+			target.State = HealthDegraded
 		}
 	}
 }
@@ -201,10 +226,14 @@ func (h *HealthMonitor) probeAll() {
 		if isOnline {
 			target.ConsecutiveFails = 0
 			target.Healthy = true
+			target.State = HealthHealthy
 		} else {
 			target.ConsecutiveFails++
 			if target.ConsecutiveFails >= 2 {
 				target.Healthy = false
+				target.State = HealthUnhealthy
+			} else {
+				target.State = HealthDegraded
 			}
 		}
 
