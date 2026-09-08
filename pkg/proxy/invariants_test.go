@@ -315,3 +315,111 @@ func TestInvariant_P8_WebhookReplayHMACIntegrity(t *testing.T) {
 		t.Errorf("P8 Invariant Violated: signature %s does not contain expected HMAC %s", val, expectedSig)
 	}
 }
+
+// P9: Egress security policy modes, custom CIDRs, and wildcard host allowlists.
+func TestInvariant_P9_EgressSecurityModesAndCIDRs(t *testing.T) {
+	// 1. allow_all_except_metadata mode
+	pMeta := NewEgressSecurityPolicy(EgressModeAllowAllExceptMetadata, true)
+	if err := pMeta.ValidateDestination("169.254.169.254:80"); err == nil {
+		t.Errorf("P9 Invariant Violated: expected metadata IP to be blocked")
+	}
+	if err := pMeta.ValidateDestination("127.0.0.1:8080"); err != nil {
+		t.Errorf("P9 Invariant Violated: expected 127.0.0.1 to be allowed in allow_all_except_metadata mode, got %v", err)
+	}
+
+	// 2. allow_all_except_private mode
+	pPrivate := NewEgressSecurityPolicy(EgressModeAllowAllExceptPrivate, true)
+	if err := pPrivate.ValidateDestination("127.0.0.1:8080"); err == nil {
+		t.Errorf("P9 Invariant Violated: expected loopback to be blocked in allow_all_except_private mode")
+	}
+	if err := pPrivate.ValidateDestination("10.0.0.1:80"); err == nil {
+		t.Errorf("P9 Invariant Violated: expected 10.0.0.1 to be blocked in allow_all_except_private mode")
+	}
+	if err := pPrivate.ValidateDestination("192.168.1.1:443"); err == nil {
+		t.Errorf("P9 Invariant Violated: expected 192.168.1.1 to be blocked in allow_all_except_private mode")
+	}
+	if err := pPrivate.ValidateDestination("172.16.0.5:8000"); err == nil {
+		t.Errorf("P9 Invariant Violated: expected 172.16.0.5 to be blocked in allow_all_except_private mode")
+	}
+	if err := pPrivate.ValidateDestination("8.8.8.8:53"); err != nil {
+		t.Errorf("P9 Invariant Violated: expected public IP 8.8.8.8 to be allowed, got %v", err)
+	}
+
+	// 3. strict mode with wildcard allowlist
+	pStrict := &EgressSecurityPolicy{
+		Mode:          EgressModeStrict,
+		BlockMetadata: true,
+		AllowedHosts:  []string{"127.0.0.1", "api.stripe.com", "*.github.com"},
+	}
+	if !pStrict.IsHostAllowed("api.stripe.com") {
+		t.Errorf("P9 Invariant Violated: expected api.stripe.com to match allowed hosts")
+	}
+	if !pStrict.IsHostAllowed("hooks.github.com") {
+		t.Errorf("P9 Invariant Violated: expected hooks.github.com to match wildcard allowed hosts")
+	}
+	if pStrict.IsHostAllowed("evil.com") {
+		t.Errorf("P9 Invariant Violated: evil.com should not match allowed hosts")
+	}
+	if err := pStrict.ValidateDestination("127.0.0.1:8080"); err != nil {
+		t.Errorf("P9 Invariant Violated: expected explicitly allowed 127.0.0.1 to pass in strict mode, got %v", err)
+	}
+	if err := pStrict.ValidateDestination("10.0.0.1:8080"); err == nil {
+		t.Errorf("P9 Invariant Violated: expected unlisted IP 10.0.0.1 to be blocked in strict mode")
+	}
+	if err := pStrict.ValidateDestination("evil.com:80"); err == nil {
+		t.Errorf("P9 Invariant Violated: expected unlisted host evil.com to be blocked in strict mode")
+	}
+
+	// 4. Custom denied CIDRs
+	pCustom := &EgressSecurityPolicy{
+		Mode:          EgressModeAllowAllExceptMetadata,
+		BlockMetadata: true,
+		DeniedCIDRs:   ParsePrefixes([]string{"203.0.113.0/24"}),
+	}
+	if err := pCustom.ValidateDestination("203.0.113.50:80"); err == nil {
+		t.Errorf("P9 Invariant Violated: expected 203.0.113.50 to be blocked by custom CIDR")
+	}
+	if err := pCustom.ValidateDestination("203.0.114.1:80"); err != nil {
+		t.Errorf("P9 Invariant Violated: expected 203.0.114.1 outside CIDR to be allowed, got %v", err)
+	}
+}
+
+// P10: Replay response memory budget truncates responses at 1MB to prevent OOM.
+func TestInvariant_P10_ReplayResponseMemoryBudget(t *testing.T) {
+	// Upstream returns 2MB of data
+	largeData := strings.Repeat("X", 2*1024*1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(largeData))
+	}))
+	defer upstream.Close()
+
+	uURL, _ := url.Parse(upstream.URL)
+	r := router.NewRouter()
+	r.Add("/large-resp", uURL, true)
+
+	engine := NewEngine(r, buffer.NewRingBuffer(10), nil)
+	dispatcher := NewReplayDispatcher(engine)
+
+	replayResp, err := dispatcher.Execute(ReplayRequest{
+		Method: "GET",
+		URL:    "/large-resp",
+	})
+	if err != nil {
+		t.Fatalf("replay execution failed: %v", err)
+	}
+
+	if replayResp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK, got %d", replayResp.StatusCode)
+	}
+
+	const maxBudget = 1024 * 1024
+	if len(replayResp.Body) <= maxBudget {
+		t.Errorf("expected response to exceed 1MB before truncation marker, got %d bytes", len(replayResp.Body))
+	}
+	if !strings.Contains(replayResp.Body, "[response truncated by DevHub 1MB replay limit]") {
+		t.Errorf("P10 Invariant Violated: expected truncation message in replay body")
+	}
+}
+

@@ -1,4 +1,4 @@
-# ⚡ DevHub v2.5 Pro
+# ⚡ DevHub v2.6 Pro
 ### High-Performance Microservice Switchboard, Zero-Config Mesh & Developer Cockpit
 
 DevHub is an industrial-grade developer platform that combines the capabilities of **Ngrok, Traefik, Postman, and OpenTelemetry** into a single zero-dependency binary for local and containerized microservice development.
@@ -6,7 +6,7 @@ DevHub is an industrial-grade developer platform that combines the capabilities 
 ```
   ┌────────────────────────────────────────────────────────────────────────┐
   │  ██████╗ ███████╗██╗   ██╗██╗  ██╗██╗   ██╗██████╗                     │
-  │  ██╔══██╗██╔════╝██║   ██║██║  ██║██║   ██║██╔══██╗   DEVHUB v2.5 PRO  │
+  │  ██╔══██╗██╔════╝██║   ██║██║  ██║██║   ██║██╔══██╗   DEVHUB v2.6 PRO  │
   │  ██║  ██║█████╗  ██║   ██║███████║██║   ██║██████╔╝   Mesh Switchboard │
   │  ██║  ██║██╔══╝  ╚██╗ ██╔╝██╔══██║██║   ██║██╔══██╗   & Live Debugger  │
   │  ██████╔╝███████╗ ╚████╔╝ ██║  ██║╚██████╔╝██████╔╝                    │
@@ -111,7 +111,18 @@ ingress:
 
 docker:
   enabled: true
+  mode: "strict" # "strict" (requires devhub.route), "opt_in" (devhub.enable=true), or "automatic"
   poll_logs: true
+
+egress:
+  enabled: true
+  mode: "allow_all_except_metadata" # "allow_all_except_metadata", "allow_all_except_private", or "strict"
+  allowed_hosts:
+    - "api.stripe.com"
+    - "*.github.com"
+  denied_cidrs:
+    - "169.254.169.254/32"
+    - "fd00:ec2::254/128"
 
 tracing:
   enabled: true

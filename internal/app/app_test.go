@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -252,3 +254,127 @@ func TestApp_TicketAuthAndTelemetryStats(t *testing.T) {
 		t.Errorf("expected queue_capacity 4096, got %v", stats["queue_capacity"])
 	}
 }
+
+func TestApp_SynchronousListenerFailure(t *testing.T) {
+	// Pre-bind a port to cause collision
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer l.Close()
+
+	port := l.Addr().(*net.TCPAddr).Port
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Host:          "127.0.0.1",
+			ProxyPort:     port, // Collision!
+			DashboardPort: 0,
+		},
+	}
+
+	application, err := New(cfg)
+	if err != nil {
+		t.Fatalf("failed to init app: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = application.Start(ctx)
+	if err == nil {
+		application.Shutdown(context.Background())
+		t.Fatalf("expected error binding occupied proxy port, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to bind proxy port") {
+		t.Errorf("expected 'failed to bind proxy port' error message, got: %v", err)
+	}
+}
+
+func TestApp_TicketCleanupAndCapping(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			DashboardPort:      19080,
+			DashboardAuthToken: "admintoken",
+		},
+	}
+	application, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	dashMux := http.NewServeMux()
+	application.setupDashboardRoutes(dashMux)
+	server := httptest.NewServer(dashMux)
+	defer server.Close()
+
+	// Seed 10 expired tickets
+	application.ticketMu.Lock()
+	for i := 0; i < 10; i++ {
+		application.tickets[fmt.Sprintf("expired_%d", i)] = time.Now().Add(-10 * time.Minute)
+	}
+	application.ticketMu.Unlock()
+
+	// Call ticket endpoint
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/api/auth/ticket", nil)
+	req.Header.Set("Authorization", "Bearer admintoken")
+	res, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("ticket request failed: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", res.StatusCode)
+	}
+
+	application.ticketMu.Lock()
+	ticketCount := len(application.tickets)
+	for tKey := range application.tickets {
+		if strings.HasPrefix(tKey, "expired_") {
+			t.Errorf("found expired ticket that should have been pruned: %s", tKey)
+		}
+	}
+	application.ticketMu.Unlock()
+
+	if ticketCount != 1 {
+		t.Errorf("expected exactly 1 active ticket after prune, got %d", ticketCount)
+	}
+}
+
+func TestApp_OriginVerification(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			DashboardPort: 8081,
+			DashboardHost: "127.0.0.1",
+		},
+	}
+	application, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	dashMux := http.NewServeMux()
+	application.setupDashboardRoutes(dashMux)
+	server := httptest.NewServer(dashMux)
+	defer server.Close()
+
+	// Test cross-origin websocket upgrade attempt from unauthorized origin
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/ws", nil)
+	req.Header.Set("Origin", "http://evil-attacker.com")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+
+	res, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for cross-origin WS attempt, got %d", res.StatusCode)
+	}
+}
+

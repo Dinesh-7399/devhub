@@ -94,7 +94,7 @@ type Engine struct {
 func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffer.TraceEvent)) *Engine {
 	health := NewHealthMonitor()
 	mocks := mock.NewManager()
-	secPolicy := NewEgressSecurityPolicy(true) // Block cloud metadata SSRF by default
+	secPolicy := NewEgressSecurityPolicy(EgressModeAllowAllExceptMetadata, true) // Block cloud metadata SSRF by default
 
 	// Ingress transport: explicitly Proxy: nil to prevent recursion if HTTP_PROXY is set
 	ingressTransport := &http.Transport{
@@ -118,12 +118,12 @@ func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffe
 		KeepAlive: 30 * time.Second,
 	}
 
-	// Forward transport: separate client transport with Proxy: nil and SSRF destination validation
+	// Forward transport: separate client transport with Proxy: nil and TOCTOU-free validated IP dialer
 	forwardTransport := &http.Transport{
 		Proxy: nil,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if err := secPolicy.ValidateDestination(addr); err != nil {
-				return nil, err
+			if secPolicy != nil {
+				return secPolicy.DialValidatedContext(ctx, dialer, network, addr)
 			}
 			return dialer.DialContext(ctx, network, addr)
 		},
@@ -521,22 +521,34 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 
 // handleConnectTunnel handles HTTPS/TLS CONNECT forward proxy tunnels with full lifecycle duration tracking.
 func (e *Engine) handleConnectTunnel(w http.ResponseWriter, req *http.Request, start time.Time) {
-	// Validate destination against egress policy before hijacking or dialing
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	var upstreamConn net.Conn
+	var dialErr error
+
 	if e.SecurityPolicy != nil {
-		if err := e.SecurityPolicy.ValidateDestination(req.URL.Host); err != nil {
-			http.Error(w, fmt.Sprintf("Forbidden: %v", err), http.StatusForbidden)
-			e.emitTraceEvent(buffer.TraceEvent{
-				ID:         fastTraceID(),
-				Timestamp:  time.Now().Format("15:04:05.000"),
-				Method:     "CONNECT",
-				Path:       req.URL.Host,
-				Target:     "[Egress Blocked] " + req.URL.Host,
-				StatusCode: http.StatusForbidden,
-				DurationMs: time.Since(start).Milliseconds(),
-			})
-			return
-		}
+		upstreamConn, dialErr = e.SecurityPolicy.DialValidatedContext(req.Context(), dialer, "tcp", req.URL.Host)
+	} else {
+		upstreamConn, dialErr = dialer.DialContext(req.Context(), "tcp", req.URL.Host)
 	}
+
+	if dialErr != nil {
+		statusCode := http.StatusBadGateway
+		if strings.Contains(dialErr.Error(), "blocked") || strings.Contains(dialErr.Error(), "forbidden") {
+			statusCode = http.StatusForbidden
+		}
+		http.Error(w, fmt.Sprintf("DevHub CONNECT Error: %v", dialErr), statusCode)
+		e.emitTraceEvent(buffer.TraceEvent{
+			ID:         fastTraceID(),
+			Timestamp:  time.Now().Format("15:04:05.000"),
+			Method:     "CONNECT",
+			Path:       req.URL.Host,
+			Target:     "[Egress Blocked] " + req.URL.Host,
+			StatusCode: statusCode,
+			DurationMs: time.Since(start).Milliseconds(),
+		})
+		return
+	}
+	defer upstreamConn.Close()
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -550,14 +562,6 @@ func (e *Engine) handleConnectTunnel(w http.ResponseWriter, req *http.Request, s
 		return
 	}
 	defer clientConn.Close()
-
-	upstreamConn, err := net.DialTimeout("tcp", req.URL.Host, 10*time.Second)
-	if err != nil {
-		brw.WriteString("HTTP/1.1 502 Bad Gateway\r\n\r\n")
-		brw.Flush()
-		return
-	}
-	defer upstreamConn.Close()
 
 	brw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
 	brw.Flush()

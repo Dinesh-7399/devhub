@@ -17,6 +17,7 @@ type Config struct {
 	Server    ServerConfig              `yaml:"server"`
 	Ingress   IngressConfig             `yaml:"ingress"` // Alternative shorthand
 	Docker    DockerConfig              `yaml:"docker"`
+	Egress    EgressConfig              `yaml:"egress"`
 	Tunnel    TunnelConfig              `yaml:"tunnel"`
 	Tracing   TracingConfig             `yaml:"tracing"`
 	Routes    []RouteConfig             `yaml:"routes"`
@@ -27,6 +28,14 @@ type Config struct {
 type IngressConfig struct {
 	Port      int `yaml:"port"`
 	Dashboard int `yaml:"dashboard"`
+}
+
+// EgressConfig defines the egress proxy network security policy.
+type EgressConfig struct {
+	Enabled      bool     `yaml:"enabled"`
+	Mode         string   `yaml:"mode"` // "allow_all_except_metadata", "allow_all_except_private", "strict"
+	AllowedHosts []string `yaml:"allowed_hosts"`
+	DeniedCIDRs  []string `yaml:"denied_cidrs"`
 }
 
 // OverrideConfig provides fine-grained per-route customization and mock response overrides.
@@ -53,6 +62,7 @@ type DockerConfig struct {
 	SocketPath   string `yaml:"socket_path"`
 	Network      string `yaml:"network"`
 	PollLogs     bool   `yaml:"poll_logs"`
+	Mode         string `yaml:"mode"` // "strict" (default), "opt_in", "automatic"
 	AutoRouteAll bool   `yaml:"auto_route_all"`
 }
 
@@ -116,10 +126,15 @@ func DefaultConfig() *Config {
 			EnforceCircuitBreaker:  false, // Passive health observation by default
 			BlockMetadataEndpoints: true,  // Block cloud metadata SSRF by default
 		},
+		Egress: EgressConfig{
+			Enabled: true,
+			Mode:    "allow_all_except_metadata",
+		},
 		Docker: DockerConfig{
 			Enabled:      true,
 			SocketPath:   defaultDockerSocket,
 			PollLogs:     true,
+			Mode:         "strict",
 			AutoRouteAll: false, // Strict opt-in devhub.route label required by default
 		},
 		Tunnel: TunnelConfig{

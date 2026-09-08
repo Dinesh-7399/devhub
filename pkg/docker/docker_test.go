@@ -148,3 +148,58 @@ func TestWatcher_OptInAndIdempotency(t *testing.T) {
 		t.Errorf("reconciliation should be idempotent! expected mountCount 1, got %d", mountCount)
 	}
 }
+
+func TestWatcher_Modes(t *testing.T) {
+	// Container with devhub.enable=true but no explicit devhub.route
+	enableOnly := ContainerInfo{
+		ID:    "enable-only-1",
+		Names: []string{"/inventory-service"},
+		Labels: map[string]string{
+			"devhub.enable": "true",
+			"devhub.port":   "8085",
+		},
+		Ports: []ContainerPort{{PrivatePort: 8085}},
+	}
+
+	// 1. In strict mode (default), enable-only should NOT be mounted
+	rStrict := router.NewRouter()
+	wStrict := NewWatcher(nil, rStrict, nil, nil)
+	wStrict.SetMode("strict")
+	wStrict.registerContainer(context.Background(), enableOnly)
+	if len(wStrict.GetRoutes()) != 0 {
+		t.Errorf("strict mode should ignore container without explicit devhub.route label, got %d", len(wStrict.GetRoutes()))
+	}
+
+	// 2. In opt_in mode, enable-only SHOULD be mounted via container name
+	rOptIn := router.NewRouter()
+	wOptIn := NewWatcher(nil, rOptIn, nil, nil)
+	wOptIn.SetMode("opt_in")
+	wOptIn.registerContainer(context.Background(), enableOnly)
+	if len(wOptIn.GetRoutes()) != 1 {
+		t.Fatalf("opt_in mode should mount container with devhub.enable=true, got %d", len(wOptIn.GetRoutes()))
+	}
+	if wOptIn.GetRoutes()[0].Prefix != "/inventory-service" {
+		t.Errorf("expected route /inventory-service, got %s", wOptIn.GetRoutes()[0].Prefix)
+	}
+
+	// 3. In automatic mode, unlabeled container SHOULD be mounted
+	unlabeled := ContainerInfo{
+		ID:    "unlabeled-2",
+		Names: []string{"/billing-service"},
+		Ports: []ContainerPort{{PrivatePort: 9090}},
+	}
+	rAuto := router.NewRouter()
+	wAuto := NewWatcher(nil, rAuto, nil, nil)
+	wAuto.SetMode("automatic")
+	wAuto.registerContainer(context.Background(), unlabeled)
+	if len(wAuto.GetRoutes()) != 1 {
+		t.Fatalf("automatic mode should mount unlabeled container, got %d", len(wAuto.GetRoutes()))
+	}
+	if wAuto.GetRoutes()[0].Prefix != "/billing-service" {
+		t.Errorf("expected route /billing-service, got %s", wAuto.GetRoutes()[0].Prefix)
+	}
+
+	// Verify Stop()
+	wAuto.Stop()
+}
+

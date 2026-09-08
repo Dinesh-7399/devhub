@@ -7,10 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,7 +26,6 @@ import (
 	"devhub/pkg/ui"
 
 	"github.com/gorilla/websocket"
-	"gopkg.in/yaml.v3"
 )
 
 // ANSI Color constants for modern terminal output
@@ -65,6 +63,7 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	mu         sync.RWMutex
+	closed     atomic.Bool
 }
 
 func newHub() *Hub {
@@ -80,8 +79,12 @@ func (h *Hub) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			h.Close()
 			return
 		case client := <-h.register:
+			if h.closed.Load() {
+				continue
+			}
 			h.mu.Lock()
 			h.clients[client] = true
 			h.mu.Unlock()
@@ -93,6 +96,9 @@ func (h *Hub) run(ctx context.Context) {
 			}
 			h.mu.Unlock()
 		case message := <-h.broadcast:
+			if h.closed.Load() {
+				continue
+			}
 			h.mu.RLock()
 			for client := range h.clients {
 				select {
@@ -106,7 +112,21 @@ func (h *Hub) run(ctx context.Context) {
 	}
 }
 
+func (h *Hub) Close() {
+	if h.closed.CompareAndSwap(false, true) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for client := range h.clients {
+			delete(h.clients, client)
+			close(client.send)
+		}
+	}
+}
+
 func (h *Hub) broadcastJSON(v any) {
+	if h.closed.Load() {
+		return
+	}
 	data, err := json.Marshal(v)
 	if err != nil {
 		return
@@ -116,6 +136,7 @@ func (h *Hub) broadcastJSON(v any) {
 	default:
 	}
 }
+
 
 // App encapsulates DevHub control plane, data plane, and telemetry pipeline.
 type App struct {
@@ -179,7 +200,14 @@ func New(cfg *config.Config) (*App, error) {
 	})
 	engine.RedactPII = cfg.Tracing.RedactPII
 	engine.Health.SetCircuitBreakerEnforcement(cfg.Server.EnforceCircuitBreaker)
-	if engine.SecurityPolicy != nil {
+	if cfg.Egress.Enabled {
+		engine.SecurityPolicy = &proxy.EgressSecurityPolicy{
+			BlockMetadata: cfg.Server.BlockMetadataEndpoints,
+			Mode:          cfg.Egress.Mode,
+			AllowedHosts:  cfg.Egress.AllowedHosts,
+			DeniedCIDRs:   proxy.ParsePrefixes(cfg.Egress.DeniedCIDRs),
+		}
+	} else if engine.SecurityPolicy != nil {
 		engine.SecurityPolicy.BlockMetadata = cfg.Server.BlockMetadataEndpoints
 	}
 
@@ -208,9 +236,6 @@ func New(cfg *config.Config) (*App, error) {
 			engine.Mocks.SetRule(rule)
 		}
 	}
-
-	// Auto-detect Docker Compose files deterministically
-	autoDetectComposeFiles(r, engine.Health)
 
 	replayDispatcher := proxy.NewReplayDispatcher(engine)
 
@@ -261,6 +286,7 @@ func (a *App) Start(ctx context.Context) error {
 				}
 			}
 		})
+		a.DockerWatcher.SetMode(a.Config.Docker.Mode)
 		a.DockerWatcher.SetAutoRouteAll(a.Config.Docker.AutoRouteAll)
 		_ = a.DockerWatcher.Start(ctx)
 	}
@@ -276,11 +302,16 @@ func (a *App) Start(ctx context.Context) error {
 		_ = a.TunnelClient.Start(ctx)
 	}
 
-	// 5. Start L7 Reverse Proxy Listener
+	// 5. Start L7 Reverse Proxy Listener synchronously
 	proxyAddr := fmt.Sprintf("%s:%d", a.Config.Server.Host, a.Config.Server.ProxyPort)
 	if a.Config.Server.Host == "" {
 		proxyAddr = fmt.Sprintf(":%d", a.Config.Server.ProxyPort)
 	}
+	proxyListener, err := net.Listen("tcp", proxyAddr)
+	if err != nil {
+		return fmt.Errorf("failed to bind proxy port %s: %w", proxyAddr, err)
+	}
+
 	a.ProxyServer = &http.Server{
 		Addr:              proxyAddr,
 		Handler:           a.Engine,
@@ -288,9 +319,11 @@ func (a *App) Start(ctx context.Context) error {
 		IdleTimeout:       90 * time.Second,
 	}
 
+	a.wg.Add(1)
 	go func() {
-		if err := a.ProxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Proxy server failed: %v", err)
+		defer a.wg.Done()
+		if err := a.ProxyServer.Serve(proxyListener); err != nil && err != http.ErrServerClosed {
+			log.Printf("Proxy server error: %v", err)
 		}
 	}()
 
@@ -303,6 +336,12 @@ func (a *App) Start(ctx context.Context) error {
 		dashHost = "127.0.0.1" // Secure binding by default
 	}
 	dashAddr := fmt.Sprintf("%s:%d", dashHost, a.Config.Server.DashboardPort)
+	dashListener, err := net.Listen("tcp", dashAddr)
+	if err != nil {
+		_ = proxyListener.Close()
+		return fmt.Errorf("failed to bind dashboard port %s: %w", dashAddr, err)
+	}
+
 	a.DashboardServer = &http.Server{
 		Addr:              dashAddr,
 		Handler:           dashboardMux,
@@ -310,9 +349,11 @@ func (a *App) Start(ctx context.Context) error {
 		IdleTimeout:       90 * time.Second,
 	}
 
+	a.wg.Add(1)
 	go func() {
-		if err := a.DashboardServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Dashboard server failed: %v", err)
+		defer a.wg.Done()
+		if err := a.DashboardServer.Serve(dashListener); err != nil && err != http.ErrServerClosed {
+			log.Printf("Dashboard server error: %v", err)
 		}
 	}()
 
@@ -335,6 +376,13 @@ func (a *App) Shutdown(ctx context.Context) error {
 			firstErr = err
 		}
 	}
+	if a.Hub != nil {
+		a.Hub.Close()
+	}
+	if a.DockerWatcher != nil {
+		a.DockerWatcher.Stop()
+	}
+	a.wg.Wait()
 	return firstErr
 }
 
@@ -350,13 +398,18 @@ func (a *App) setupDashboardRoutes(mux *http.ServeMux) {
 			if err != nil {
 				return false
 			}
-			// Allow origin matching host or localhost / 127.0.0.1
+			if u.Scheme != "http" && u.Scheme != "https" {
+				return false
+			}
 			reqHost := r.Host
+			dashPort := fmt.Sprintf("%d", a.Config.Server.DashboardPort)
+			expectedHost1 := "localhost:" + dashPort
+			expectedHost2 := "127.0.0.1:" + dashPort
+
 			if strings.EqualFold(u.Host, reqHost) ||
-				strings.HasPrefix(u.Host, "localhost:") ||
-				strings.HasPrefix(u.Host, "127.0.0.1:") ||
-				u.Host == "localhost" ||
-				u.Host == "127.0.0.1" {
+				strings.EqualFold(u.Host, expectedHost1) ||
+				strings.EqualFold(u.Host, expectedHost2) ||
+				(dashPort == "80" && (u.Host == "localhost" || u.Host == "127.0.0.1")) {
 				return true
 			}
 			return false
@@ -384,8 +437,20 @@ func (a *App) setupDashboardRoutes(mux *http.ServeMux) {
 		_, _ = rand.Read(b)
 		ticket := hex.EncodeToString(b)
 
+		now := time.Now()
 		a.ticketMu.Lock()
-		a.tickets[ticket] = time.Now().Add(60 * time.Second)
+		for t, exp := range a.tickets {
+			if now.After(exp) {
+				delete(a.tickets, t)
+			}
+		}
+		if len(a.tickets) < 1000 {
+			a.tickets[ticket] = now.Add(60 * time.Second)
+		} else {
+			a.ticketMu.Unlock()
+			http.Error(w, "Too many active tickets", http.StatusServiceUnavailable)
+			return
+		}
 		a.ticketMu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -438,11 +503,21 @@ func (a *App) setupDashboardRoutes(mux *http.ServeMux) {
 			conn: conn,
 			send: make(chan []byte, 256),
 		}
+
+		if a.Hub.closed.Load() {
+			conn.Close()
+			return
+		}
 		a.Hub.register <- client
 
 		go func() {
 			defer func() {
-				a.Hub.unregister <- client
+				if !a.Hub.closed.Load() {
+					select {
+					case a.Hub.unregister <- client:
+					case <-time.After(100 * time.Millisecond):
+					}
+				}
 				conn.Close()
 			}()
 			for message := range client.send {
@@ -574,7 +649,7 @@ func printHeaderBanner(cfg *config.Config) {
 	fmt.Println()
 	fmt.Printf("%s%s  ┌────────────────────────────────────────────────────────────────────────┐%s\n", colBold, colCyan, colReset)
 	fmt.Printf("%s%s  │  ██████╗ ███████╗██╗   ██╗██╗  ██╗██╗   ██╗██████╗                     │%s\n", colBold, colCyan, colReset)
-	fmt.Printf("%s%s  │  ██╔══██╗██╔════╝██║   ██║██║  ██║██║   ██║██╔══██╗   DEVHUB v2.5 PRO  │%s\n", colBold, colCyan, colReset)
+	fmt.Printf("%s%s  │  ██╔══██╗██╔════╝██║   ██║██║  ██║██║   ██║██╔══██╗   DEVHUB v2.6 PRO  │%s\n", colBold, colCyan, colReset)
 	fmt.Printf("%s%s  │  ██║  ██║█████╗  ██║   ██║███████║██║   ██║██████╔╝   Mesh Switchboard │%s\n", colBold, colSky, colReset)
 	fmt.Printf("%s%s  │  ██║  ██║██╔══╝  ╚██╗ ██╔╝██╔══██║██║   ██║██╔══██╗   & Live Debugger  │%s\n", colBold, colSky, colReset)
 	fmt.Printf("%s%s  │  ██████╔╝███████╗ ╚████╔╝ ██║  ██║╚██████╔╝██████╔╝                    │%s\n", colBold, colPurple, colReset)
@@ -655,61 +730,4 @@ func printLiveTerminalLog(ev buffer.TraceEvent) {
 		colGray, targetDisp, colReset,
 		colPurple, traceShort, colReset,
 	)
-}
-
-type rawCompose struct {
-	Services map[string]struct {
-		Ports []string `yaml:"ports"`
-	} `yaml:"services"`
-}
-
-func autoDetectComposeFiles(r *router.Router, health *proxy.HealthMonitor) {
-	composeFiles := []string{"docker-compose.yml", "docker-compose.yaml", "docker-compose.infra.yml"}
-	for _, f := range composeFiles {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			continue
-		}
-
-		var comp rawCompose
-		if err := yaml.Unmarshal(data, &comp); err != nil {
-			continue
-		}
-
-		for serviceName, svc := range comp.Services {
-			if len(svc.Ports) == 0 {
-				continue
-			}
-
-			hostPort := parseHostPort(svc.Ports[0])
-			if hostPort == 0 {
-				continue
-			}
-
-			targetURL, _ := url.Parse(fmt.Sprintf("http://localhost:%d", hostPort))
-			routePrefix := "/api/" + serviceName
-			r.Add(routePrefix, targetURL, true)
-			if health != nil {
-				health.RegisterTarget(targetURL, "tcp")
-			}
-		}
-	}
-}
-
-func parseHostPort(portDef string) int {
-	parts := strings.Split(portDef, ":")
-	if len(parts) >= 2 {
-		pStr := parts[0]
-		if len(parts) == 3 {
-			pStr = parts[1] // e.g. "127.0.0.1:8080:80"
-		}
-		if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
-			return p
-		}
-	} else if len(parts) == 1 {
-		if p, err := strconv.Atoi(parts[0]); err == nil && p > 0 {
-			return p
-		}
-	}
-	return 0
 }

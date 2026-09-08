@@ -28,6 +28,7 @@ type ContainerRoute struct {
 type Watcher struct {
 	client       *Client
 	router       *router.Router
+	mode         string // "strict", "opt_in", "automatic"
 	autoRouteAll bool
 	mu           sync.RWMutex
 	routes       map[string]*ContainerRoute
@@ -41,7 +42,8 @@ func NewWatcher(client *Client, r *router.Router, onLog func(LogEntry), onRoute 
 	return &Watcher{
 		client:       client,
 		router:       r,
-		autoRouteAll: false, // Strict opt-in devhub.route label required by default
+		mode:         "strict", // Strict opt-in devhub.route label required by default
+		autoRouteAll: false,
 		routes:       make(map[string]*ContainerRoute),
 		logStreams:   make(map[string]context.CancelFunc),
 		onLog:        onLog,
@@ -49,11 +51,21 @@ func NewWatcher(client *Client, r *router.Router, onLog func(LogEntry), onRoute 
 	}
 }
 
+// SetMode configures the container discovery mode ("strict", "opt_in", "automatic").
+func (w *Watcher) SetMode(mode string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.mode = mode
+}
+
 // SetAutoRouteAll controls whether unlabeled containers should be automatically routed by container name.
 func (w *Watcher) SetAutoRouteAll(enable bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.autoRouteAll = enable
+	if enable {
+		w.mode = "automatic"
+	}
 }
 
 // Start begins initial discovery and long-running event listening.
@@ -104,18 +116,33 @@ func (w *Watcher) syncContainers(ctx context.Context) error {
 }
 
 func (w *Watcher) registerContainer(ctx context.Context, c ContainerInfo) {
+	w.mu.RLock()
+	mode := w.mode
+	w.mu.RUnlock()
+	if mode == "" {
+		mode = "strict"
+	}
+
 	routePrefix := c.Labels["devhub.route"]
 	if routePrefix == "" {
 		routePrefix = c.Labels["devhub.path"]
 	}
 
-	// If no explicit route label, check if container name has a default route
+	// In strict mode, explicit devhub.route or devhub.path is strictly required
 	name := strings.TrimPrefix(strings.Join(c.Names, ","), "/")
 	if routePrefix == "" && len(c.Names) > 0 {
 		cleanName := strings.TrimPrefix(c.Names[0], "/")
 		if cleanName != "" && !strings.HasPrefix(cleanName, "devhub") {
-			// Strict opt-in: only route unlabeled containers if devhub.enable is true OR autoRouteAll is set
-			if c.Labels["devhub.enable"] == "true" || w.autoRouteAll {
+			switch mode {
+			case "strict":
+				// Strictly requires explicit route label; do not auto-name
+			case "opt_in":
+				// Allows devhub.enable=true with container name derived route
+				if c.Labels["devhub.enable"] == "true" {
+					routePrefix = "/" + cleanName
+				}
+			case "automatic":
+				// Automatic mode: route any active container
 				routePrefix = "/" + cleanName
 			}
 		}
@@ -308,3 +335,14 @@ func (w *Watcher) GetRoutes() []*ContainerRoute {
 	}
 	return list
 }
+
+// Stop terminates all active container log streams.
+func (w *Watcher) Stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, cancel := range w.logStreams {
+		cancel()
+	}
+	w.logStreams = make(map[string]context.CancelFunc)
+}
+

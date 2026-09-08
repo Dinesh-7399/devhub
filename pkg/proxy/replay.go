@@ -109,12 +109,18 @@ func (d *ReplayDispatcher) Execute(reqPayload ReplayRequest) (*ReplayResponse, e
 	resp := rec.Result()
 	defer resp.Body.Close()
 
-	respBytes, _ := io.ReadAll(resp.Body)
+	const maxReplayCapture = 1024 * 1024 // 1MB replay response body budget
+	limitedReader := io.LimitReader(resp.Body, maxReplayCapture+1)
+	respBytes, _ := io.ReadAll(limitedReader)
+	bodyStr := string(respBytes)
+	if len(respBytes) > maxReplayCapture {
+		bodyStr = string(respBytes[:maxReplayCapture]) + "\n...[response truncated by DevHub 1MB replay limit]"
+	}
 
 	return &ReplayResponse{
 		StatusCode: resp.StatusCode,
 		Headers:    extractHeaders(resp.Header),
-		Body:       string(respBytes),
+		Body:       bodyStr,
 		DurationMs: duration,
 		TraceID:    traceID,
 	}, nil
