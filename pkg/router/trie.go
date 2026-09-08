@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // RouteTarget holds upstream routing information.
@@ -12,6 +13,7 @@ type RouteTarget struct {
 	Target      *url.URL
 	StripPrefix bool
 	Prefix      string
+	Timeout     time.Duration
 }
 
 // TrieNode represents a path segment node in the routing trie.
@@ -54,6 +56,11 @@ func NewRouter() *Router {
 
 // Add registers a URL prefix route to an upstream target using atomic RCU copy.
 func (r *Router) Add(prefix string, targetURL *url.URL, stripPrefix bool) {
+	r.AddWithTimeout(prefix, targetURL, stripPrefix, 0)
+}
+
+// AddWithTimeout registers a URL prefix route with an optional per-route timeout.
+func (r *Router) AddWithTimeout(prefix string, targetURL *url.URL, stripPrefix bool, timeout time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -63,42 +70,36 @@ func (r *Router) Add(prefix string, targetURL *url.URL, stripPrefix bool) {
 		segments = strings.Split(clean, "/")
 	}
 
-	// Copy-on-write RCU clone
 	oldRoot := r.root.Load()
-	newRoot := cloneTrie(oldRoot)
-
-	curr := newRoot
+	newRoot := oldRoot.clone()
+	currOld := oldRoot
+	currNew := newRoot
 	for _, seg := range segments {
-		if _, exists := curr.children[seg]; !exists {
-			curr.children[seg] = &TrieNode{children: make(map[string]*TrieNode)}
+		var oldChild *TrieNode
+		if currOld != nil {
+			oldChild = currOld.children[seg]
 		}
-		curr = curr.children[seg]
+		var newChild *TrieNode
+		if oldChild != nil {
+			newChild = oldChild.clone()
+		} else {
+			newChild = &TrieNode{children: make(map[string]*TrieNode)}
+		}
+		currNew.children[seg] = newChild
+		currNew = newChild
+		currOld = oldChild
 	}
 
-	curr.target = &RouteTarget{
+	currNew.target = &RouteTarget{
 		Target:      targetURL,
 		StripPrefix: stripPrefix,
 		Prefix:      "/" + clean,
+		Timeout:     timeout,
 	}
-	curr.isEnd = true
+	currNew.isEnd = true
 
 	// Atomically swap root pointer
 	r.root.Store(newRoot)
-}
-
-func cloneTrie(node *TrieNode) *TrieNode {
-	if node == nil {
-		return &TrieNode{children: make(map[string]*TrieNode)}
-	}
-	copyNode := &TrieNode{
-		children: make(map[string]*TrieNode, len(node.children)),
-		target:   node.target,
-		isEnd:    node.isEnd,
-	}
-	for k, v := range node.children {
-		copyNode.children[k] = cloneTrie(v)
-	}
-	return copyNode
 }
 
 // Match finds the longest registered prefix matching the path.

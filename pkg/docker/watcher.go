@@ -22,6 +22,7 @@ type ContainerRoute struct {
 	Target      *url.URL `json:"target"`
 	StripPrefix bool     `json:"strip_prefix"`
 	Port        int      `json:"port"`
+	HealthPath  string   `json:"health_path"`
 }
 
 // Watcher supervises Docker container lifecycle and maps routes automatically.
@@ -50,19 +51,20 @@ func NewWatcher(client *Client, r *router.Router, onLog func(LogEntry), onRoute 
 // Start begins initial discovery and long-running event listening.
 func (w *Watcher) Start(ctx context.Context) error {
 	// 1. Initial container sweep
-	if err := w.syncContainers(ctx); err != nil {
+	if err := w.reconcile(ctx); err != nil {
 		// Log warning but continue so non-docker routes work fine
 		fmt.Printf("⚠️ Docker discovery warning: %v\n", err)
 	}
 
 	// 2. Start event loop in background
 	go w.eventLoop(ctx)
+	go w.reconcileLoop(ctx)
 
 	return nil
 }
 
-// syncContainers scans all running containers and mounts routes for matching labels.
-func (w *Watcher) syncContainers(ctx context.Context) error {
+// reconcile scans all running containers and aligns watcher state with label-driven routes.
+func (w *Watcher) reconcile(ctx context.Context) error {
 	if w.client == nil {
 		return nil
 	}
@@ -71,46 +73,40 @@ func (w *Watcher) syncContainers(ctx context.Context) error {
 		return err
 	}
 
+	active := make(map[string]struct{}, len(containers))
 	for _, c := range containers {
+		active[c.ID] = struct{}{}
 		w.registerContainer(ctx, c)
+	}
+	for _, existing := range w.GetRoutes() {
+		if _, ok := active[existing.ID]; !ok {
+			w.unregisterContainer(existing.ID)
+		}
 	}
 	return nil
 }
 
 func (w *Watcher) registerContainer(ctx context.Context, c ContainerInfo) {
-	routePrefix := c.Labels["devhub.route"]
-	if routePrefix == "" {
-		routePrefix = c.Labels["devhub.path"]
+	if c.Labels["devhub.enabled"] != "true" {
+		return
 	}
-
-	// If no explicit route label, check if container name has a default route
-	name := strings.TrimPrefix(strings.Join(c.Names, ","), "/")
-	if routePrefix == "" && len(c.Names) > 0 {
-		cleanName := strings.TrimPrefix(c.Names[0], "/")
-		if cleanName != "" && !strings.HasPrefix(cleanName, "devhub") {
-			// Auto-route by container name e.g. /service-name
-			routePrefix = "/" + cleanName
-		}
-	}
-
+	routePrefix := strings.TrimSpace(c.Labels["devhub.route"])
 	if routePrefix == "" {
 		return
 	}
+	if !strings.HasPrefix(routePrefix, "/") {
+		routePrefix = "/" + routePrefix
+	}
+
+	name := strings.TrimPrefix(strings.Join(c.Names, ","), "/")
 
 	stripPrefix := c.Labels["devhub.strip_prefix"] == "true"
+	healthPath := strings.TrimSpace(c.Labels["devhub.health_path"])
 
-	// Resolve target port
-	targetPort := 80
-	if pStr, exists := c.Labels["devhub.port"]; exists {
-		if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
-			targetPort = p
-		}
-	} else if len(c.Ports) > 0 {
-		if c.Ports[0].PublicPort > 0 {
-			targetPort = c.Ports[0].PublicPort
-		} else if c.Ports[0].PrivatePort > 0 {
-			targetPort = c.Ports[0].PrivatePort
-		}
+	pStr := strings.TrimSpace(c.Labels["devhub.port"])
+	targetPort, err := strconv.Atoi(pStr)
+	if err != nil || targetPort <= 0 {
+		return
 	}
 
 	targetHost := "localhost"
@@ -130,6 +126,7 @@ func (w *Watcher) registerContainer(ctx context.Context, c ContainerInfo) {
 		Target:      targetURL,
 		StripPrefix: stripPrefix,
 		Port:        targetPort,
+		HealthPath:  healthPath,
 	}
 
 	w.mu.Lock()
@@ -240,9 +237,22 @@ func (w *Watcher) eventLoop(ctx context.Context) {
 				switch ev.Action {
 				case "start":
 					// Re-scan container
-					_ = w.syncContainers(ctx)
+					_ = w.reconcile(ctx)
 				case "die", "kill", "stop", "destroy":
 					w.unregisterContainer(ev.Actor.ID)
+				}
+			}
+
+			func (w *Watcher) reconcileLoop(ctx context.Context) {
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						_ = w.reconcile(ctx)
+					}
 				}
 			}
 		}
