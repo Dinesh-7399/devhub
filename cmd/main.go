@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -121,10 +122,6 @@ func (h *Hub) broadcastJSON(v any) {
 	}
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
 func main() {
 	configPath := flag.String("config", "", "Path to devhub.yaml configuration file")
 	proxyPort := flag.Int("port", 0, "Ingress proxy port (default: 4000)")
@@ -195,6 +192,7 @@ func main() {
 		printLiveTerminalLog(ev)
 	})
 	engine.RedactPII = cfg.Tracing.RedactPII
+	engine.ConfigureEgressPolicy(cfg.Security.AllowedEgressHost, !cfg.Security.AllowPrivateEgress)
 
 	// Hook health status updates into WebSocket hub
 	engine.Health.SetOnStatusChange(func(th proxy.TargetHealth) {
@@ -282,9 +280,37 @@ func main() {
 
 	// 7. Start Developer Cockpit & Real-Time Inspection Server
 	dashboardMux := http.NewServeMux()
+	authToken := strings.TrimSpace(cfg.Security.AuthToken)
+	dashboardBind := strings.TrimSpace(cfg.Security.DashboardBind)
+	if dashboardBind == "" {
+		dashboardBind = "127.0.0.1"
+	}
+	if !isLocalBindAddress(dashboardBind) && authToken == "" {
+		log.Fatalf("dashboard_bind=%q requires security.auth_token to be set", dashboardBind)
+	}
+	requireDashboardAuth := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, req *http.Request) {
+			if authToken == "" {
+				if !isLocalRequest(req) {
+					http.Error(w, "dashboard access denied", http.StatusForbidden)
+					return
+				}
+			} else if !isAuthorizedDashboardRequest(req, authToken) {
+				w.Header().Set("WWW-Authenticate", "Token realm=\"devhub-dashboard\"")
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			next(w, req)
+		}
+	}
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return isAllowedDashboardOrigin(r, cfg.Security.AllowedOrigins)
+		},
+	}
 
 	// WebSocket Live Stream Hub
-	dashboardMux.HandleFunc("/ws", func(w http.ResponseWriter, req *http.Request) {
+	dashboardMux.HandleFunc("/ws", requireDashboardAuth(func(w http.ResponseWriter, req *http.Request) {
 		conn, err := upgrader.Upgrade(w, req, nil)
 		if err != nil {
 			return
@@ -323,16 +349,16 @@ func main() {
 				break
 			}
 		}
-	})
+	}))
 
 	// Upstream Health Snapshot API
-	dashboardMux.HandleFunc("/api/health", func(w http.ResponseWriter, req *http.Request) {
+	dashboardMux.HandleFunc("/api/health", requireDashboardAuth(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(engine.Health.GetAllStatus())
-	})
+	}))
 
 	// Mock Rules API
-	dashboardMux.HandleFunc("/api/mocks", func(w http.ResponseWriter, req *http.Request) {
+	dashboardMux.HandleFunc("/api/mocks", requireDashboardAuth(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if req.Method == http.MethodPost {
 			var rule mock.MockRule
@@ -341,10 +367,10 @@ func main() {
 			}
 		}
 		json.NewEncoder(w).Encode(engine.Mocks.ListRules())
-	})
+	}))
 
 	// Mock Toggle API
-	dashboardMux.HandleFunc("/api/mocks/toggle", func(w http.ResponseWriter, req *http.Request) {
+	dashboardMux.HandleFunc("/api/mocks/toggle", requireDashboardAuth(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -358,10 +384,10 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
-	})
+	}))
 
 	// 1-Click Request Replay API
-	dashboardMux.HandleFunc("/api/replay", func(w http.ResponseWriter, req *http.Request) {
+	dashboardMux.HandleFunc("/api/replay", requireDashboardAuth(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -381,21 +407,21 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(res)
-	})
+	}))
 
 	// Trace Waterfall API
-	dashboardMux.HandleFunc("/api/waterfall", func(w http.ResponseWriter, req *http.Request) {
+	dashboardMux.HandleFunc("/api/waterfall", requireDashboardAuth(func(w http.ResponseWriter, req *http.Request) {
 		traceID := req.URL.Query().Get("trace_id")
 		w.Header().Set("Content-Type", "application/json")
 		waterfall := tracing.BuildWaterfall(ring.GetAll(), traceID)
 		json.NewEncoder(w).Encode(waterfall)
-	})
+	}))
 
 	// Traces Snapshot API
-	dashboardMux.HandleFunc("/api/traces", func(w http.ResponseWriter, req *http.Request) {
+	dashboardMux.HandleFunc("/api/traces", requireDashboardAuth(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(ring.GetAll())
-	})
+	}))
 
 	// Embedded Developer Cockpit Single-Page App
 	dashboardMux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -403,7 +429,7 @@ func main() {
 		w.Write([]byte(ui.DashboardHTML))
 	})
 
-	dashAddr := fmt.Sprintf(":%d", cfg.Server.DashboardPort)
+	dashAddr := net.JoinHostPort(dashboardBind, strconv.Itoa(cfg.Server.DashboardPort))
 	dashServer := &http.Server{
 		Addr:              dashAddr,
 		Handler:           dashboardMux,
@@ -430,6 +456,63 @@ func main() {
 	_ = proxyServer.Shutdown(shutdownCtx)
 	_ = dashServer.Shutdown(shutdownCtx)
 	fmt.Printf("%s✨ DevHub stopped successfully.%s\n", colGreen, colReset)
+}
+
+func isLocalBindAddress(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return true
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isLocalRequest(req *http.Request) bool {
+	host, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		host = req.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isAuthorizedDashboardRequest(req *http.Request, token string) bool {
+	authHeader := strings.TrimSpace(req.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+		return strings.TrimSpace(authHeader[7:]) == token
+	}
+	if strings.HasPrefix(strings.ToLower(authHeader), "token ") {
+		return strings.TrimSpace(authHeader[6:]) == token
+	}
+	return strings.TrimSpace(req.Header.Get("X-DevHub-Token")) == token
+}
+
+func isAllowedDashboardOrigin(req *http.Request, allowedOrigins []string) bool {
+	origin := strings.TrimSpace(req.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	originURL, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if len(allowedOrigins) == 0 {
+		host := strings.ToLower(originURL.Hostname())
+		return host == "localhost" || host == "127.0.0.1" || host == "::1"
+	}
+	for _, allowed := range allowedOrigins {
+		allowed = strings.TrimSpace(strings.ToLower(allowed))
+		if allowed == "" {
+			continue
+		}
+		if strings.EqualFold(origin, allowed) {
+			return true
+		}
+	}
+	return false
 }
 
 func printHeaderBanner(cfg *config.Config) {

@@ -24,6 +24,14 @@ tracing:
   redact_pii: true
   ring_size: 500
 
+# Security hardening defaults (localhost dashboard + restricted egress)
+security:
+  auth_token: ""
+  dashboard_bind: "127.0.0.1"
+  allowed_origins: []
+  allowed_egress_hosts: []
+  allow_private_egress: false
+
 # Static Routes (Supplemented dynamically by Docker container discovery)
 routes:
   - prefix: "/auth"

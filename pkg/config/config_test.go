@@ -21,6 +21,12 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	if !cfg.Docker.Enabled {
 		t.Errorf("expected docker to be enabled by default")
 	}
+	if cfg.Security.DashboardBind != "127.0.0.1" {
+		t.Errorf("expected default dashboard bind 127.0.0.1, got %q", cfg.Security.DashboardBind)
+	}
+	if cfg.Security.AllowPrivateEgress {
+		t.Errorf("expected private egress to be disabled by default")
+	}
 	if len(cfg.Routes) == 0 {
 		t.Errorf("expected default sample routes")
 	}

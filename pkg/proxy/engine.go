@@ -2,11 +2,13 @@ package proxy
 
 import (
 	"bufio"
+	"crypto/tls"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -83,7 +85,11 @@ type Engine struct {
 	Broadcast func(buffer.TraceEvent)
 	HTTPProxy *httputil.ReverseProxy
 	Transport http.RoundTripper
+	Egress    http.RoundTripper
 	RedactPII bool
+
+	blockPrivateEgress bool
+	allowedEgressHosts map[string]struct{}
 }
 
 // NewEngine initializes a high-performance streaming reverse and forward proxy engine.
@@ -92,8 +98,8 @@ func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffe
 	mocks := mock.NewManager()
 
 	// Custom high-throughput transport with tuned connection pooling
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+	ingressTransport := &http.Transport{
+		Proxy: nil,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -107,6 +113,7 @@ func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffe
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableCompression:    true, // pass raw stream chunks without re-compression CPU penalty
 	}
+	egressTransport := ingressTransport.Clone()
 
 	e := &Engine{
 		Router:    r,
@@ -114,12 +121,16 @@ func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffe
 		Health:    health,
 		Mocks:     mocks,
 		Broadcast: broadcaster,
-		Transport: transport,
+		Transport: ingressTransport,
+		Egress:    egressTransport,
 		RedactPII: true,
+
+		blockPrivateEgress: true,
+		allowedEgressHosts: make(map[string]struct{}),
 	}
 
 	e.HTTPProxy = &httputil.ReverseProxy{
-		Transport: transport,
+		Transport: ingressTransport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			route, outboundPath, matched := e.Router.Match(pr.In.URL.Path)
 			if !matched {
@@ -170,7 +181,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// 2. Forward Proxy HTTP Egress (Zero-code Service A -> Service B cascading via HTTP_PROXY)
-	if req.URL.IsAbs() || (req.URL.Host != "" && !strings.HasPrefix(req.URL.Path, "/api/") && !strings.HasPrefix(req.URL.Path, "/auth") && req.URL.Scheme != "") {
+	if isForwardProxyHTTPRequest(req) {
 		e.handleForwardProxyHTTP(w, req, start)
 		return
 	}
@@ -340,12 +351,15 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 	}
 	req.Header.Set("X-DevHub-Egress", "true")
 
-	// Read body for inspection
-	var reqBodyStr string
+	// Stream body while capping capture in memory.
+	var reqCap *captureBuffer
 	if req.Body != nil && req.Body != http.NoBody {
-		bodyBytes, _ := io.ReadAll(req.Body)
-		reqBodyStr = string(bodyBytes)
-		req.Body = io.NopCloser(strings.NewReader(reqBodyStr))
+		reqCap = capturePool.Get().(*captureBuffer)
+		reqCap.reset()
+		req.Body = &bodySniffer{
+			reader:  req.Body,
+			capture: reqCap,
+		}
 	}
 
 	outboundReq, err := http.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), req.Body)
@@ -357,15 +371,12 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 		outboundReq.Header[k] = v
 	}
 
-	resp, err := e.Transport.RoundTrip(outboundReq)
+	resp, err := e.Egress.RoundTrip(outboundReq)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("DevHub Egress Proxy Error: %v", err), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-
-	respBytes, _ := io.ReadAll(resp.Body)
-	duration := time.Since(start).Milliseconds()
 
 	for k, v := range resp.Header {
 		for _, val := range v {
@@ -373,7 +384,19 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	w.Write(respBytes)
+
+	respCap := capturePool.Get().(*captureBuffer)
+	respCap.reset()
+	_, _ = io.Copy(w, io.TeeReader(resp.Body, &captureWriter{capture: respCap}))
+	duration := time.Since(start).Milliseconds()
+
+	var reqBodyStr string
+	if reqCap != nil {
+		reqBodyStr = reqCap.string()
+		capturePool.Put(reqCap)
+	}
+	respBodyStr := respCap.string()
+	capturePool.Put(respCap)
 
 	event := buffer.TraceEvent{
 		ID:           fastTraceID(),
@@ -387,7 +410,7 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 		ReqHeaders:   extractHeaders(req.Header),
 		RespHeaders:  extractHeaders(resp.Header),
 		RequestBody:  reqBodyStr,
-		ResponseBody: string(respBytes),
+		ResponseBody: respBodyStr,
 	}
 	if e.Ring != nil {
 		e.Ring.Push(event)
@@ -399,6 +422,11 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 
 // handleConnectTunnel handles HTTPS/TLS CONNECT forward proxy tunnels.
 func (e *Engine) handleConnectTunnel(w http.ResponseWriter, req *http.Request, start time.Time) {
+	if !e.isEgressAllowed(req.URL.Host, true) {
+		http.Error(w, "CONNECT target blocked by egress policy", http.StatusForbidden)
+		return
+	}
+
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "CONNECT hijack unsupported", http.StatusInternalServerError)
@@ -477,12 +505,7 @@ func (e *Engine) proxyWebSocket(w http.ResponseWriter, req *http.Request, target
 	defer clientConn.Close()
 
 	// Dial upstream target TCP socket
-	host := targetURL.Host
-	if !hasPort(host) {
-		host = host + ":80"
-	}
-
-	upstreamConn, err := net.DialTimeout("tcp", host, 5*time.Second)
+	upstreamConn, err := dialWebSocketUpstream(targetURL)
 	if err != nil {
 		brw.WriteString("HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		brw.Flush()
@@ -549,6 +572,17 @@ func (s *bodySniffer) Close() error {
 		return s.reader.Close()
 	}
 	return nil
+}
+
+type captureWriter struct {
+	capture *captureBuffer
+}
+
+func (w *captureWriter) Write(p []byte) (int, error) {
+	if w.capture != nil {
+		w.capture.write(p)
+	}
+	return len(p), nil
 }
 
 // responseCapturer captures HTTP status code and response body while supporting streaming (Flusher/Hijacker).
@@ -657,4 +691,127 @@ func extractHeaders(h http.Header) map[string]string {
 		}
 	}
 	return out
+}
+
+// ConfigureEgressPolicy updates allowed host patterns and private-network blocking behavior.
+func (e *Engine) ConfigureEgressPolicy(allowedHosts []string, blockPrivate bool) {
+	e.blockPrivateEgress = blockPrivate
+	e.allowedEgressHosts = make(map[string]struct{}, len(allowedHosts))
+	for _, host := range allowedHosts {
+		trimmed := strings.ToLower(strings.TrimSpace(host))
+		if trimmed == "" {
+			continue
+		}
+		e.allowedEgressHosts[trimmed] = struct{}{}
+	}
+}
+
+func isForwardProxyHTTPRequest(req *http.Request) bool {
+	if req == nil || !req.URL.IsAbs() || req.URL.Host == "" || req.Host == "" {
+		return false
+	}
+	return normalizeHost(req.Host) == normalizeHost(req.URL.Host)
+}
+
+func normalizeHost(hostport string) string {
+	hostport = strings.TrimSpace(strings.ToLower(hostport))
+	if hostport == "" {
+		return ""
+	}
+	host := hostport
+	port := ""
+	if h, p, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+		port = p
+	}
+	host = strings.Trim(host, "[]")
+	if port == "80" || port == "443" {
+		return host
+	}
+	if port == "" {
+		return host
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func dialWebSocketUpstream(targetURL *url.URL) (net.Conn, error) {
+	host := targetURL.Hostname()
+	port := targetURL.Port()
+	secure := strings.EqualFold(targetURL.Scheme, "wss") || strings.EqualFold(targetURL.Scheme, "https")
+	if port == "" {
+		if secure {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	addr := net.JoinHostPort(host, port)
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	if secure {
+		return tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: host,
+		})
+	}
+	return dialer.Dial("tcp", addr)
+}
+
+func (e *Engine) isEgressAllowed(target string, assumeHTTPSPort bool) bool {
+	host := target
+	port := ""
+	if h, p, err := net.SplitHostPort(target); err == nil {
+		host = h
+		port = p
+	} else if assumeHTTPSPort {
+		port = "443"
+	}
+
+	host = strings.Trim(strings.ToLower(host), "[]")
+	hostPort := host
+	if port != "" {
+		hostPort = net.JoinHostPort(host, port)
+	}
+
+	if len(e.allowedEgressHosts) > 0 {
+		if _, ok := e.allowedEgressHosts[host]; !ok {
+			if _, ok := e.allowedEgressHosts[hostPort]; !ok {
+				return false
+			}
+		}
+	}
+
+	if !e.blockPrivateEgress {
+		return true
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return false
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		return !isPrivateIP(ip)
+	}
+
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return false
+	}
+	for _, ip := range ips {
+		if isPrivateIP(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+func isPrivateIP(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	return addr.IsLoopback() ||
+		addr.IsPrivate() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		addr.IsMulticast() ||
+		addr.IsUnspecified()
 }
