@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -76,14 +78,15 @@ var capturerPool = sync.Pool{
 
 // Engine coordinates the reverse proxy, forward proxy (HTTP_PROXY), routing trie, mock manager, and live telemetry.
 type Engine struct {
-	Router    *router.Router
-	Ring      *buffer.RingBuffer
-	Health    *HealthMonitor
-	Mocks     *mock.Manager
-	Broadcast func(buffer.TraceEvent)
-	HTTPProxy *httputil.ReverseProxy
-	Transport http.RoundTripper
-	RedactPII bool
+	Router           *router.Router
+	Ring             *buffer.RingBuffer
+	Health           *HealthMonitor
+	Mocks            *mock.Manager
+	Broadcast        func(buffer.TraceEvent)
+	HTTPProxy        *httputil.ReverseProxy
+	Transport        http.RoundTripper // Ingress transport (no env proxy recursion)
+	ForwardTransport http.RoundTripper // Egress forward proxy transport
+	RedactPII        bool
 }
 
 // NewEngine initializes a high-performance streaming reverse and forward proxy engine.
@@ -91,9 +94,9 @@ func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffe
 	health := NewHealthMonitor()
 	mocks := mock.NewManager()
 
-	// Custom high-throughput transport with tuned connection pooling
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+	// Ingress transport: explicitly Proxy: nil to prevent recursion if HTTP_PROXY is set
+	ingressTransport := &http.Transport{
+		Proxy: nil,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -108,18 +111,36 @@ func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffe
 		DisableCompression:    true, // pass raw stream chunks without re-compression CPU penalty
 	}
 
+	// Forward transport: separate client transport with Proxy: nil (no self-referential loop)
+	forwardTransport := &http.Transport{
+		Proxy: nil,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10000,
+		MaxIdleConnsPerHost:   1000,
+		MaxConnsPerHost:       0,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    true,
+	}
+
 	e := &Engine{
-		Router:    r,
-		Ring:      ring,
-		Health:    health,
-		Mocks:     mocks,
-		Broadcast: broadcaster,
-		Transport: transport,
-		RedactPII: true,
+		Router:           r,
+		Ring:             ring,
+		Health:           health,
+		Mocks:            mocks,
+		Broadcast:        broadcaster,
+		Transport:        ingressTransport,
+		ForwardTransport: forwardTransport,
+		RedactPII:        true,
 	}
 
 	e.HTTPProxy = &httputil.ReverseProxy{
-		Transport: transport,
+		Transport: ingressTransport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			route, outboundPath, matched := e.Router.Match(pr.In.URL.Path)
 			if !matched {
@@ -159,6 +180,22 @@ func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffe
 	return e
 }
 
+// emitTraceEvent pushes a trace event to the ring buffer and broadcast channel safely.
+func (e *Engine) emitTraceEvent(ev buffer.TraceEvent) {
+	if e.RedactPII {
+		ev.ReqHeaders = tracing.RedactHeaders(ev.ReqHeaders)
+		ev.RespHeaders = tracing.RedactHeaders(ev.RespHeaders)
+		ev.RequestBody = tracing.RedactBody(ev.RequestBody)
+		ev.ResponseBody = tracing.RedactBody(ev.ResponseBody)
+	}
+	if e.Ring != nil {
+		e.Ring.Push(ev)
+	}
+	if e.Broadcast != nil {
+		e.Broadcast(ev)
+	}
+}
+
 // ServeHTTP handles incoming client requests, forward proxy (HTTP_PROXY), route matches, and WebSockets.
 func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
@@ -191,7 +228,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			duration := time.Since(start).Milliseconds()
 			traceID, _, _, _ := tracing.ExtractOrGenerateContext(req.Header)
 
-			event := buffer.TraceEvent{
+			e.emitTraceEvent(buffer.TraceEvent{
 				ID:           fastTraceID(),
 				TraceID:      traceID,
 				Timestamp:    time.Now().Format("15:04:05.000"),
@@ -203,20 +240,28 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				ReqHeaders:   extractHeaders(req.Header),
 				RespHeaders:  mockRule.Headers,
 				ResponseBody: mockRule.Body,
-			}
-			if e.Ring != nil {
-				e.Ring.Push(event)
-			}
-			if e.Broadcast != nil {
-				e.Broadcast(event)
-			}
+			})
 			return
 		}
 	}
 
 	route, outboundPath, matched := e.Router.Match(req.URL.Path)
 	if !matched {
+		duration := time.Since(start).Milliseconds()
+		traceID, _, _, _ := tracing.ExtractOrGenerateContext(req.Header)
 		http.Error(w, "DevHub: No registered route for path "+req.URL.Path, http.StatusNotFound)
+		e.emitTraceEvent(buffer.TraceEvent{
+			ID:          fastTraceID(),
+			TraceID:     traceID,
+			Timestamp:   time.Now().Format("15:04:05.000"),
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			Target:      "[No Route Matched]",
+			StatusCode:  http.StatusNotFound,
+			DurationMs:  duration,
+			ReqHeaders:  extractHeaders(req.Header),
+			RespHeaders: map[string]string{"Content-Type": "text/plain; charset=utf-8"},
+		})
 		return
 	}
 
@@ -226,8 +271,8 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// 5. Active circuit breaker check
-	if e.Health != nil && !e.Health.IsHealthy(route.Target) {
+	// 5. Circuit breaker check (only blocks if active enforcement is explicitly enabled)
+	if e.Health != nil && e.Health.IsCircuitBroken(route.Target) {
 		// If mock fallback exists on error
 		if e.Mocks != nil {
 			if mockRule, found := e.Mocks.GetRule(req.URL.Path); found && mockRule.Enabled {
@@ -237,12 +282,46 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				w.Header().Set("X-DevHub-Mock-Fallback", "true")
 				w.WriteHeader(mockRule.StatusCode)
 				w.Write([]byte(mockRule.Body))
+
+				traceID, _, _, _ := tracing.ExtractOrGenerateContext(req.Header)
+				e.emitTraceEvent(buffer.TraceEvent{
+					ID:           fastTraceID(),
+					TraceID:      traceID,
+					Timestamp:    time.Now().Format("15:04:05.000"),
+					Method:       req.Method,
+					Path:         req.URL.Path,
+					Target:       "[Circuit Broken Fallback] " + route.Target.String(),
+					StatusCode:   mockRule.StatusCode,
+					DurationMs:   time.Since(start).Milliseconds(),
+					ReqHeaders:   extractHeaders(req.Header),
+					RespHeaders:  mockRule.Headers,
+					ResponseBody: mockRule.Body,
+				})
 				return
 			}
 		}
 
+		traceID, _, _, _ := tracing.ExtractOrGenerateContext(req.Header)
 		http.Error(w, fmt.Sprintf("DevHub: Upstream %s is currently marked UNHEALTHY (Circuit Broken)", route.Target), http.StatusServiceUnavailable)
+		e.emitTraceEvent(buffer.TraceEvent{
+			ID:         fastTraceID(),
+			TraceID:    traceID,
+			Timestamp:  time.Now().Format("15:04:05.000"),
+			Method:     req.Method,
+			Path:       req.URL.Path,
+			Target:     "[Circuit Broken] " + route.Target.String(),
+			StatusCode: http.StatusServiceUnavailable,
+			DurationMs: time.Since(start).Milliseconds(),
+			ReqHeaders: extractHeaders(req.Header),
+		})
 		return
+	}
+
+	// Apply per-route execution timeout if configured
+	if route.TimeoutMs > 0 {
+		timeoutCtx, cancel := context.WithTimeout(req.Context(), time.Duration(route.TimeoutMs)*time.Millisecond)
+		defer cancel()
+		req = req.WithContext(timeoutCtx)
 	}
 
 	// Extract or stamp W3C Distributed Tracing context
@@ -292,18 +371,10 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	respBodyStr := rw.string()
-
 	reqHeaders := extractHeaders(req.Header)
 	respHeaders := extractHeaders(rw.Header())
 
-	if e.RedactPII {
-		reqHeaders = tracing.RedactHeaders(reqHeaders)
-		respHeaders = tracing.RedactHeaders(respHeaders)
-		reqBodyStr = tracing.RedactBody(reqBodyStr)
-		respBodyStr = tracing.RedactBody(respBodyStr)
-	}
-
-	event := buffer.TraceEvent{
+	e.emitTraceEvent(buffer.TraceEvent{
 		ID:           fastTraceID(),
 		TraceID:      traceID,
 		Timestamp:    time.Now().Format("15:04:05.000"),
@@ -316,20 +387,14 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		RespHeaders:  respHeaders,
 		RequestBody:  reqBodyStr,
 		ResponseBody: respBodyStr,
-	}
+	})
 
 	// Recycle response capturer
 	capturerPool.Put(rw)
-
-	if e.Ring != nil {
-		e.Ring.Push(event)
-	}
-	if e.Broadcast != nil {
-		e.Broadcast(event)
-	}
 }
 
-// handleForwardProxyHTTP handles HTTP requests made via HTTP_PROXY environment variables (Service A -> Service B).
+// handleForwardProxyHTTP handles HTTP requests made via HTTP_PROXY environment variables (Service A -> Service B)
+// with true streaming, chunk flushing, and bounded payload capture without memory exhaustion.
 func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request, start time.Time) {
 	traceID, parentSpanID, spanID, traceparent := tracing.ExtractOrGenerateContext(req.Header)
 	req.Header.Set("traceparent", traceparent)
@@ -340,16 +405,22 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 	}
 	req.Header.Set("X-DevHub-Egress", "true")
 
-	// Read body for inspection
-	var reqBodyStr string
+	// Stream request body with bounded tee capture (does not buffer entire body in RAM)
+	var reqCap *captureBuffer
 	if req.Body != nil && req.Body != http.NoBody {
-		bodyBytes, _ := io.ReadAll(req.Body)
-		reqBodyStr = string(bodyBytes)
-		req.Body = io.NopCloser(strings.NewReader(reqBodyStr))
+		reqCap = capturePool.Get().(*captureBuffer)
+		reqCap.reset()
+		req.Body = &bodySniffer{
+			reader:  req.Body,
+			capture: reqCap,
+		}
 	}
 
 	outboundReq, err := http.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), req.Body)
 	if err != nil {
+		if reqCap != nil {
+			capturePool.Put(reqCap)
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -357,25 +428,72 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 		outboundReq.Header[k] = v
 	}
 
-	resp, err := e.Transport.RoundTrip(outboundReq)
+	// Use dedicated ForwardTransport (no environment proxy recursion)
+	resp, err := e.ForwardTransport.RoundTrip(outboundReq)
 	if err != nil {
+		duration := time.Since(start).Milliseconds()
+		var reqBodyStr string
+		if reqCap != nil {
+			reqBodyStr = reqCap.string()
+			capturePool.Put(reqCap)
+		}
 		http.Error(w, fmt.Sprintf("DevHub Egress Proxy Error: %v", err), http.StatusBadGateway)
+		e.emitTraceEvent(buffer.TraceEvent{
+			ID:          fastTraceID(),
+			TraceID:     traceID,
+			Timestamp:   time.Now().Format("15:04:05.000"),
+			Method:      req.Method,
+			Path:        req.URL.Path,
+			Target:      "[Egress Error] " + req.URL.Host + req.URL.Path,
+			StatusCode:  http.StatusBadGateway,
+			DurationMs:  duration,
+			ReqHeaders:  extractHeaders(req.Header),
+			RequestBody: reqBodyStr,
+		})
 		return
 	}
 	defer resp.Body.Close()
 
-	respBytes, _ := io.ReadAll(resp.Body)
-	duration := time.Since(start).Milliseconds()
-
+	// Copy response headers
 	for k, v := range resp.Header {
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	w.Write(respBytes)
 
-	event := buffer.TraceEvent{
+	// Stream response chunks continuously with immediate flushing
+	respCap := capturePool.Get().(*captureBuffer)
+	respCap.reset()
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, rErr := resp.Body.Read(buf)
+		if n > 0 {
+			respCap.write(buf[:n])
+			if _, wErr := w.Write(buf[:n]); wErr != nil {
+				break
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+		if rErr != nil {
+			break
+		}
+	}
+
+	duration := time.Since(start).Milliseconds()
+
+	var reqBodyStr string
+	if reqCap != nil {
+		reqBodyStr = reqCap.string()
+		capturePool.Put(reqCap)
+	}
+	respBodyStr := respCap.string()
+	capturePool.Put(respCap)
+
+	e.emitTraceEvent(buffer.TraceEvent{
 		ID:           fastTraceID(),
 		TraceID:      traceID,
 		Timestamp:    time.Now().Format("15:04:05.000"),
@@ -387,17 +505,11 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 		ReqHeaders:   extractHeaders(req.Header),
 		RespHeaders:  extractHeaders(resp.Header),
 		RequestBody:  reqBodyStr,
-		ResponseBody: string(respBytes),
-	}
-	if e.Ring != nil {
-		e.Ring.Push(event)
-	}
-	if e.Broadcast != nil {
-		e.Broadcast(event)
-	}
+		ResponseBody: respBodyStr,
+	})
 }
 
-// handleConnectTunnel handles HTTPS/TLS CONNECT forward proxy tunnels.
+// handleConnectTunnel handles HTTPS/TLS CONNECT forward proxy tunnels with full lifecycle duration tracking.
 func (e *Engine) handleConnectTunnel(w http.ResponseWriter, req *http.Request, start time.Time) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -425,25 +537,6 @@ func (e *Engine) handleConnectTunnel(w http.ResponseWriter, req *http.Request, s
 
 	traceID, _, _, _ := tracing.ExtractOrGenerateContext(req.Header)
 
-	event := buffer.TraceEvent{
-		ID:          fastTraceID(),
-		TraceID:     traceID,
-		Timestamp:   time.Now().Format("15:04:05.000"),
-		Method:      "CONNECT",
-		Path:        req.URL.Host,
-		Target:      "[Egress Tunnel] " + req.URL.Host,
-		StatusCode:  http.StatusOK,
-		DurationMs:  time.Since(start).Milliseconds(),
-		ReqHeaders:  extractHeaders(req.Header),
-		RespHeaders: map[string]string{"Proxy-Agent": "DevHub"},
-	}
-	if e.Ring != nil {
-		e.Ring.Push(event)
-	}
-	if e.Broadcast != nil {
-		e.Broadcast(event)
-	}
-
 	// Full-duplex pipe
 	errc := make(chan error, 2)
 	go func() {
@@ -455,6 +548,20 @@ func (e *Engine) handleConnectTunnel(w http.ResponseWriter, req *http.Request, s
 		errc <- err
 	}()
 	<-errc
+
+	// Record full tunnel session duration
+	e.emitTraceEvent(buffer.TraceEvent{
+		ID:          fastTraceID(),
+		TraceID:     traceID,
+		Timestamp:   time.Now().Format("15:04:05.000"),
+		Method:      "CONNECT",
+		Path:        req.URL.Host,
+		Target:      "[Egress Tunnel] " + req.URL.Host,
+		StatusCode:  http.StatusOK,
+		DurationMs:  time.Since(start).Milliseconds(),
+		ReqHeaders:  extractHeaders(req.Header),
+		RespHeaders: map[string]string{"Proxy-Agent": "DevHub"},
+	})
 }
 
 func isWebSocketRequest(req *http.Request) bool {
@@ -462,6 +569,7 @@ func isWebSocketRequest(req *http.Request) bool {
 		strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade")
 }
 
+// proxyWebSocket proxies WebSockets with TLS/WSS scheme awareness and verified upstream handshakes.
 func (e *Engine) proxyWebSocket(w http.ResponseWriter, req *http.Request, targetURL *url.URL, outboundPath string, start time.Time) {
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -476,28 +584,136 @@ func (e *Engine) proxyWebSocket(w http.ResponseWriter, req *http.Request, target
 	}
 	defer clientConn.Close()
 
-	// Dial upstream target TCP socket
-	host := targetURL.Host
-	if !hasPort(host) {
-		host = host + ":80"
+	// Scheme-aware host & port resolution
+	isTLS := targetURL.Scheme == "https" || targetURL.Scheme == "wss"
+	defaultPort := "80"
+	if isTLS {
+		defaultPort = "443"
 	}
 
-	upstreamConn, err := net.DialTimeout("tcp", host, 5*time.Second)
-	if err != nil {
+	host := targetURL.Host
+	if !hasPort(host) {
+		host = host + ":" + defaultPort
+	}
+
+	traceID, _, _, _ := tracing.ExtractOrGenerateContext(req.Header)
+
+	// Establish TCP or TLS connection to upstream
+	var upstreamConn net.Conn
+	if isTLS {
+		hostOnly, _, _ := net.SplitHostPort(host)
+		tlsConfig := &tls.Config{
+			ServerName: hostOnly,
+		}
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
+		conn, dialErr := tls.DialWithDialer(dialer, "tcp", host, tlsConfig)
+		if dialErr != nil {
+			brw.WriteString("HTTP/1.1 502 Bad Gateway\r\n\r\n")
+			brw.Flush()
+			e.emitTraceEvent(buffer.TraceEvent{
+				ID:         fastTraceID(),
+				TraceID:    traceID,
+				Timestamp:  time.Now().Format("15:04:05.000"),
+				Method:     "WS",
+				Path:       req.URL.Path,
+				Target:     targetURL.String() + outboundPath,
+				StatusCode: http.StatusBadGateway,
+				DurationMs: time.Since(start).Milliseconds(),
+				ReqHeaders: extractHeaders(req.Header),
+			})
+			return
+		}
+		upstreamConn = conn
+	} else {
+		conn, dialErr := net.DialTimeout("tcp", host, 5*time.Second)
+		if dialErr != nil {
+			brw.WriteString("HTTP/1.1 502 Bad Gateway\r\n\r\n")
+			brw.Flush()
+			e.emitTraceEvent(buffer.TraceEvent{
+				ID:         fastTraceID(),
+				TraceID:    traceID,
+				Timestamp:  time.Now().Format("15:04:05.000"),
+				Method:     "WS",
+				Path:       req.URL.Path,
+				Target:     targetURL.String() + outboundPath,
+				StatusCode: http.StatusBadGateway,
+				DurationMs: time.Since(start).Milliseconds(),
+				ReqHeaders: extractHeaders(req.Header),
+			})
+			return
+		}
+		upstreamConn = conn
+	}
+	defer upstreamConn.Close()
+
+	// Forward upgrade handshake request to upstream
+	req.URL.Path = outboundPath
+	if err := req.Write(upstreamConn); err != nil {
 		brw.WriteString("HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		brw.Flush()
 		return
 	}
-	defer upstreamConn.Close()
 
-	// Forward raw upgrade request to upstream
-	req.URL.Path = outboundPath
-	req.Write(upstreamConn)
+	// Read and validate upstream handshake response
+	upstreamReader := bufio.NewReader(upstreamConn)
+	upstreamResp, err := http.ReadResponse(upstreamReader, req)
+	if err != nil {
+		brw.WriteString("HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		brw.Flush()
+		e.emitTraceEvent(buffer.TraceEvent{
+			ID:         fastTraceID(),
+			TraceID:    traceID,
+			Timestamp:  time.Now().Format("15:04:05.000"),
+			Method:     "WS",
+			Path:       req.URL.Path,
+			Target:     targetURL.String() + outboundPath,
+			StatusCode: http.StatusBadGateway,
+			DurationMs: time.Since(start).Milliseconds(),
+			ReqHeaders: extractHeaders(req.Header),
+		})
+		return
+	}
 
-	traceID, _, _, _ := tracing.ExtractOrGenerateContext(req.Header)
+	// If upstream did NOT return 101 Switching Protocols, forward actual status code & abort upgrade
+	if upstreamResp.StatusCode != http.StatusSwitchingProtocols {
+		_ = upstreamResp.Write(brw)
+		brw.Flush()
+		e.emitTraceEvent(buffer.TraceEvent{
+			ID:          fastTraceID(),
+			TraceID:     traceID,
+			Timestamp:   time.Now().Format("15:04:05.000"),
+			Method:      "WS",
+			Path:        req.URL.Path,
+			Target:      targetURL.String() + outboundPath,
+			StatusCode:  upstreamResp.StatusCode,
+			DurationMs:  time.Since(start).Milliseconds(),
+			ReqHeaders:  extractHeaders(req.Header),
+			RespHeaders: extractHeaders(upstreamResp.Header),
+		})
+		return
+	}
 
-	// Record WebSocket session start trace
-	event := buffer.TraceEvent{
+	// Forward successful 101 response to client
+	if err := upstreamResp.Write(brw); err != nil {
+		return
+	}
+	brw.Flush()
+
+	// Bidirectional full-duplex copy
+	errc := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(upstreamConn, brw)
+		errc <- err
+	}()
+	go func() {
+		_, err := io.Copy(clientConn, upstreamReader)
+		errc <- err
+	}()
+
+	<-errc
+
+	// Record full session lifecycle duration
+	e.emitTraceEvent(buffer.TraceEvent{
 		ID:          fastTraceID(),
 		TraceID:     traceID,
 		Timestamp:   time.Now().Format("15:04:05.000"),
@@ -507,27 +723,8 @@ func (e *Engine) proxyWebSocket(w http.ResponseWriter, req *http.Request, target
 		StatusCode:  http.StatusSwitchingProtocols,
 		DurationMs:  time.Since(start).Milliseconds(),
 		ReqHeaders:  extractHeaders(req.Header),
-		RespHeaders: map[string]string{"Upgrade": "websocket", "Connection": "Upgrade"},
-	}
-	if e.Ring != nil {
-		e.Ring.Push(event)
-	}
-	if e.Broadcast != nil {
-		e.Broadcast(event)
-	}
-
-	// Bidirectional full-duplex copy
-	errc := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(upstreamConn, brw)
-		errc <- err
-	}()
-	go func() {
-		_, err := io.Copy(clientConn, upstreamConn)
-		errc <- err
-	}()
-
-	<-errc
+		RespHeaders: extractHeaders(upstreamResp.Header),
+	})
 }
 
 // bodySniffer tees read bytes into pooled memory up to maxCaptureSize without allocating or truncating.
@@ -657,4 +854,9 @@ func extractHeaders(h http.Header) map[string]string {
 		}
 	}
 	return out
+}
+
+func hasPort(host string) bool {
+	_, _, err := net.SplitHostPort(host)
+	return err == nil
 }

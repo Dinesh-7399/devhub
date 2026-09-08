@@ -31,16 +31,19 @@ type IngressConfig struct {
 
 // OverrideConfig provides fine-grained per-route customization and mock response overrides.
 type OverrideConfig struct {
-	Target      string          `yaml:"target"`
-	StripPrefix bool            `yaml:"strip_prefix"`
-	Mock        mock.MockRule   `yaml:"mock"`
+	Target      string        `yaml:"target"`
+	StripPrefix bool          `yaml:"strip_prefix"`
+	Mock        mock.MockRule `yaml:"mock"`
 }
 
-// ServerConfig configures proxy and dashboard HTTP ports.
+// ServerConfig configures proxy, dashboard HTTP ports, binding interfaces, and security options.
 type ServerConfig struct {
-	ProxyPort     int    `yaml:"proxy_port"`
-	DashboardPort int    `yaml:"dashboard_port"`
-	Host          string `yaml:"host"`
+	ProxyPort             int    `yaml:"proxy_port"`
+	DashboardPort         int    `yaml:"dashboard_port"`
+	Host                  string `yaml:"host"`
+	DashboardHost         string `yaml:"dashboard_host"`
+	DashboardAuthToken    string `yaml:"dashboard_auth_token"`
+	EnforceCircuitBreaker bool   `yaml:"enforce_circuit_breaker"`
 }
 
 // DockerConfig configures Docker Engine auto-discovery.
@@ -75,6 +78,21 @@ type RouteConfig struct {
 	TimeoutMs       int64  `yaml:"timeout_ms"`
 }
 
+// ValidateRouteTarget ensures the target URL has a valid scheme (http/https) and non-empty host.
+func ValidateRouteTarget(target string) error {
+	u, err := url.Parse(target)
+	if err != nil {
+		return fmt.Errorf("invalid target URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("target URL scheme must be http or https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("target URL host cannot be empty")
+	}
+	return nil
+}
+
 // DefaultConfig returns production-ready default settings.
 func DefaultConfig() *Config {
 	var defaultDockerSocket string
@@ -87,9 +105,12 @@ func DefaultConfig() *Config {
 	return &Config{
 		Version: "1.0",
 		Server: ServerConfig{
-			ProxyPort:     4000,
-			DashboardPort: 4040,
-			Host:          "0.0.0.0",
+			ProxyPort:             4000,
+			DashboardPort:         4040,
+			Host:                  "0.0.0.0",
+			DashboardHost:         "127.0.0.1", // Secure localhost binding by default
+			DashboardAuthToken:    "",
+			EnforceCircuitBreaker: false, // Passive health observation by default
 		},
 		Docker: DockerConfig{
 			Enabled:    true,
@@ -181,8 +202,8 @@ func LoadConfig(path string) (*Config, error) {
 		if r.Target == "" {
 			return nil, fmt.Errorf("route #%d target cannot be empty", i)
 		}
-		if _, err := url.Parse(r.Target); err != nil {
-			return nil, fmt.Errorf("route #%d invalid target URL %q: %w", i, r.Target, err)
+		if err := ValidateRouteTarget(r.Target); err != nil {
+			return nil, fmt.Errorf("route #%d invalid target: %w", i, err)
 		}
 	}
 
@@ -194,6 +215,9 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		cleanPrefix := "/" + strings.Trim(prefix, "/")
 		if ov.Target != "" {
+			if err := ValidateRouteTarget(ov.Target); err != nil {
+				return nil, fmt.Errorf("override %q invalid target: %w", prefix, err)
+			}
 			found := false
 			for idx, r := range cfg.Routes {
 				if r.Prefix == cleanPrefix {
@@ -216,11 +240,14 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Tracing.RingSize <= 0 {
 		cfg.Tracing.RingSize = 500
 	}
-	if cfg.Server.ProxyPort <= 0 {
+	if cfg.Server.ProxyPort <= 0 || cfg.Server.ProxyPort >= 65536 {
 		cfg.Server.ProxyPort = 4000
 	}
-	if cfg.Server.DashboardPort <= 0 {
+	if cfg.Server.DashboardPort <= 0 || cfg.Server.DashboardPort >= 65536 {
 		cfg.Server.DashboardPort = 4040
+	}
+	if cfg.Server.DashboardHost == "" {
+		cfg.Server.DashboardHost = "127.0.0.1"
 	}
 
 	return cfg, nil

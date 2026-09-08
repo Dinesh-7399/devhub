@@ -12,6 +12,7 @@ type RouteTarget struct {
 	Target      *url.URL
 	StripPrefix bool
 	Prefix      string
+	TimeoutMs   int64
 }
 
 // TrieNode represents a path segment node in the routing trie.
@@ -21,7 +22,8 @@ type TrieNode struct {
 	isEnd    bool
 }
 
-// cloneNode creates a deep copy of a trie node for lock-free RCU updates.
+// clone creates a shallow copy of the node's map and metadata for persistent path-copying.
+// Children subtrees are shared unless explicitly cloned along the modified path.
 func (n *TrieNode) clone() *TrieNode {
 	if n == nil {
 		return &TrieNode{children: make(map[string]*TrieNode)}
@@ -37,14 +39,14 @@ func (n *TrieNode) clone() *TrieNode {
 	return newNode
 }
 
-// Router provides 100% LOCK-FREE Longest-Prefix-Matching (LPM) route resolution in O(k) time
-// using Read-Copy-Update (RCU) atomic pointers. Reads execute with zero mutex locking and zero allocations.
+// Router provides a lock-free read path using atomic pointers with synchronized
+// copy-on-write persistent path updates. Route lookup executes with zero mutex locking.
 type Router struct {
 	root atomic.Pointer[TrieNode]
-	mu   sync.Mutex // Mutex is used ONLY during route registration/writes, never on reads
+	mu   sync.Mutex // Mutex guards route updates; reads never acquire locks
 }
 
-// NewRouter constructs an empty lock-free prefix router.
+// NewRouter constructs an empty prefix router.
 func NewRouter() *Router {
 	r := &Router{}
 	root := &TrieNode{children: make(map[string]*TrieNode)}
@@ -52,8 +54,14 @@ func NewRouter() *Router {
 	return r
 }
 
-// Add registers a URL prefix route to an upstream target using atomic RCU copy.
+// Add registers a URL prefix route to an upstream target using copy-on-write persistent path-copying.
+// Only nodes along the route path are cloned; all untouched branches remain shared.
 func (r *Router) Add(prefix string, targetURL *url.URL, stripPrefix bool) {
+	r.AddWithTimeout(prefix, targetURL, stripPrefix, 0)
+}
+
+// AddWithTimeout registers a URL prefix route with an optional per-route execution timeout.
+func (r *Router) AddWithTimeout(prefix string, targetURL *url.URL, stripPrefix bool, timeoutMs int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -63,22 +71,27 @@ func (r *Router) Add(prefix string, targetURL *url.URL, stripPrefix bool) {
 		segments = strings.Split(clean, "/")
 	}
 
-	// Copy-on-write RCU clone
 	oldRoot := r.root.Load()
-	newRoot := cloneTrie(oldRoot)
+	newRoot := oldRoot.clone()
 
 	curr := newRoot
 	for _, seg := range segments {
-		if _, exists := curr.children[seg]; !exists {
-			curr.children[seg] = &TrieNode{children: make(map[string]*TrieNode)}
+		child, exists := curr.children[seg]
+		var nextNode *TrieNode
+		if exists {
+			nextNode = child.clone()
+		} else {
+			nextNode = &TrieNode{children: make(map[string]*TrieNode)}
 		}
-		curr = curr.children[seg]
+		curr.children[seg] = nextNode
+		curr = nextNode
 	}
 
 	curr.target = &RouteTarget{
 		Target:      targetURL,
 		StripPrefix: stripPrefix,
 		Prefix:      "/" + clean,
+		TimeoutMs:   timeoutMs,
 	}
 	curr.isEnd = true
 
@@ -86,23 +99,70 @@ func (r *Router) Add(prefix string, targetURL *url.URL, stripPrefix bool) {
 	r.root.Store(newRoot)
 }
 
-func cloneTrie(node *TrieNode) *TrieNode {
-	if node == nil {
-		return &TrieNode{children: make(map[string]*TrieNode)}
+// Remove unmounts a URL prefix route using copy-on-write persistent path-copying.
+// Returns true if the route was found and removed.
+func (r *Router) Remove(prefix string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	clean := strings.Trim(prefix, "/")
+	var segments []string
+	if clean != "" {
+		segments = strings.Split(clean, "/")
 	}
-	copyNode := &TrieNode{
-		children: make(map[string]*TrieNode, len(node.children)),
-		target:   node.target,
-		isEnd:    node.isEnd,
+
+	oldRoot := r.root.Load()
+	if oldRoot == nil {
+		return false
 	}
-	for k, v := range node.children {
-		copyNode.children[k] = cloneTrie(v)
+
+	newRoot := oldRoot.clone()
+
+	// Track cloned path
+	type step struct {
+		node *TrieNode
+		seg  string
 	}
-	return copyNode
+	path := []step{{node: newRoot, seg: ""}}
+
+	curr := newRoot
+	for _, seg := range segments {
+		child, exists := curr.children[seg]
+		if !exists {
+			return false // Route not present
+		}
+		newChild := child.clone()
+		curr.children[seg] = newChild
+		path = append(path, step{node: newChild, seg: seg})
+		curr = newChild
+	}
+
+	if !curr.isEnd {
+		return false
+	}
+
+	curr.isEnd = false
+	curr.target = nil
+
+	// Prune dead nodes bottom-up
+	for i := len(path) - 1; i > 0; i-- {
+		n := path[i].node
+		seg := path[i].seg
+		parent := path[i-1].node
+
+		if len(n.children) == 0 && !n.isEnd {
+			delete(parent.children, seg)
+		} else {
+			break
+		}
+	}
+
+	r.root.Store(newRoot)
+	return true
 }
 
 // Match finds the longest registered prefix matching the path.
-// Operates with 100% LOCK-FREE execution and ZERO heap allocations.
+// Operates lock-free on the read path.
 func (r *Router) Match(path string) (*RouteTarget, string, bool) {
 	curr := r.root.Load()
 	if curr == nil {
@@ -139,13 +199,15 @@ func (r *Router) Match(path string) (*RouteTarget, string, bool) {
 			break
 		}
 		curr = next
+		i = start + len(segment)
+		// Skip trailing slashes
+		for i < len(path) && path[i] == '/' {
+			i++
+		}
+
 		if curr.isEnd {
 			lastMatchedTarget = curr.target
 			matchedIndex = i
-		}
-
-		for i < len(path) && path[i] == '/' {
-			i++
 		}
 	}
 
@@ -154,12 +216,12 @@ func (r *Router) Match(path string) (*RouteTarget, string, bool) {
 	}
 
 	outboundPath := path
-	if lastMatchedTarget.StripPrefix && lastMatchedTarget.Prefix != "/" {
+	if lastMatchedTarget.StripPrefix {
 		if matchedIndex >= len(path) {
 			outboundPath = "/"
 		} else {
 			outboundPath = path[matchedIndex:]
-			if len(outboundPath) == 0 || outboundPath[0] != '/' {
+			if !strings.HasPrefix(outboundPath, "/") {
 				outboundPath = "/" + outboundPath
 			}
 		}

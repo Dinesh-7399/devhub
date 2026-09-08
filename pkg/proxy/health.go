@@ -9,24 +9,36 @@ import (
 	"time"
 )
 
+// Health status classifications
+const (
+	StatusHealthy   = "HEALTHY"
+	StatusDegraded  = "DEGRADED"
+	StatusUnhealthy = "UNHEALTHY"
+	StatusUnknown   = "UNKNOWN"
+)
+
 // TargetHealth tracks the health status of an upstream microservice.
 type TargetHealth struct {
 	Name             string    `json:"name"`
 	URL              string    `json:"url"`
 	Host             string    `json:"host"`
 	Healthy          bool      `json:"healthy"`
+	Status           string    `json:"status"` // HEALTHY, DEGRADED, UNHEALTHY, UNKNOWN
 	ConsecutiveFails int       `json:"consecutive_fails"`
 	LastChecked      time.Time `json:"last_checked"`
 	LatencyMs        int64     `json:"latency_ms"`
 	HealthPath       string    `json:"health_path"`
+	Message          string    `json:"message,omitempty"`
 }
 
 // HealthMonitor conducts active and passive health checks on registered upstreams.
+// By default, it operates in passive observation mode, updating telemetry without blocking traffic.
 type HealthMonitor struct {
-	mu             sync.RWMutex
-	targets        map[string]*TargetHealth
-	client         *http.Client
-	onStatusChange func(th TargetHealth)
+	mu                     sync.RWMutex
+	targets                map[string]*TargetHealth
+	client                 *http.Client
+	onStatusChange         func(th TargetHealth)
+	EnforceCircuitBreaker  bool // If false, health monitor observes without returning 503
 }
 
 // NewHealthMonitor initializes an upstream health monitor.
@@ -36,7 +48,15 @@ func NewHealthMonitor() *HealthMonitor {
 		client: &http.Client{
 			Timeout: 2 * time.Second,
 		},
+		EnforceCircuitBreaker: false, // Default: passive observation only
 	}
+}
+
+// SetCircuitBreakerEnforcement enables or disables active 503 blocking on unhealthy upstreams.
+func (h *HealthMonitor) SetCircuitBreakerEnforcement(enabled bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.EnforceCircuitBreaker = enabled
 }
 
 // SetOnStatusChange sets the callback for broadcasting health state flips to WebSockets.
@@ -46,7 +66,7 @@ func (h *HealthMonitor) SetOnStatusChange(fn func(TargetHealth)) {
 	h.onStatusChange = fn
 }
 
-// RegisterTarget adds a target URL to active health monitoring.
+// RegisterTarget adds a target URL to health monitoring.
 func (h *HealthMonitor) RegisterTarget(u *url.URL, healthPath string) {
 	if u == nil {
 		return
@@ -56,14 +76,16 @@ func (h *HealthMonitor) RegisterTarget(u *url.URL, healthPath string) {
 
 	key := u.String()
 	if _, exists := h.targets[key]; !exists {
+		// If no health path is provided, default to TCP liveness probe
 		if healthPath == "" {
-			healthPath = "/health"
+			healthPath = "tcp"
 		}
 		h.targets[key] = &TargetHealth{
 			Name:       u.Host,
 			URL:        u.String(),
 			Host:       u.Host,
 			Healthy:    true,
+			Status:     StatusHealthy,
 			HealthPath: healthPath,
 		}
 	}
@@ -83,6 +105,25 @@ func (h *HealthMonitor) IsHealthy(u *url.URL) bool {
 	return true // Default to healthy if unmonitored
 }
 
+// IsCircuitBroken returns whether the circuit breaker should actively reject requests.
+// Returns false if circuit breaker enforcement is disabled.
+func (h *HealthMonitor) IsCircuitBroken(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if !h.EnforceCircuitBreaker {
+		return false // Passive observation mode: never block
+	}
+
+	if target, exists := h.targets[u.String()]; exists {
+		return !target.Healthy
+	}
+	return false
+}
+
 // RecordSuccess registers a successful response from an upstream target.
 func (h *HealthMonitor) RecordSuccess(u *url.URL) {
 	if u == nil {
@@ -95,6 +136,7 @@ func (h *HealthMonitor) RecordSuccess(u *url.URL) {
 		wasUnhealthy := !target.Healthy
 		target.ConsecutiveFails = 0
 		target.Healthy = true
+		target.Status = StatusHealthy
 		target.LastChecked = time.Now()
 		if wasUnhealthy && h.onStatusChange != nil {
 			go h.onStatusChange(*target)
@@ -116,6 +158,7 @@ func (h *HealthMonitor) RecordFailure(u *url.URL) {
 		target.LastChecked = time.Now()
 		if target.ConsecutiveFails >= 3 {
 			target.Healthy = false
+			target.Status = StatusUnhealthy
 			if wasHealthy && h.onStatusChange != nil {
 				go h.onStatusChange(*target)
 			}
@@ -135,7 +178,7 @@ func (h *HealthMonitor) GetAllStatus() []TargetHealth {
 	return out
 }
 
-// Start runs background active probing for all registered targets every 3 seconds.
+// Start runs background active probing for all registered targets.
 func (h *HealthMonitor) Start(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 3 * time.Second
@@ -143,21 +186,20 @@ func (h *HealthMonitor) Start(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	go func() {
 		defer ticker.Stop()
-		// Initial probe
-		h.probeAll()
+		h.probeAll(ctx)
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				h.probeAll()
+				h.probeAll(ctx)
 			}
 		}
 	}()
 }
 
-func (h *HealthMonitor) probeAll() {
+func (h *HealthMonitor) probeAll(ctx context.Context) {
 	h.mu.RLock()
 	targetsList := make([]*TargetHealth, 0, len(h.targets))
 	for _, t := range h.targets {
@@ -166,44 +208,71 @@ func (h *HealthMonitor) probeAll() {
 	h.mu.RUnlock()
 
 	for _, target := range targetsList {
-		start := time.Now()
-		isOnline := false
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 
-		// 1. First try fast TCP socket probe (works for HTTP, gRPC, and DBs)
+		start := time.Now()
 		host := target.Host
 		if !hasPort(host) {
 			host = host + ":80"
 		}
 
-		conn, err := net.DialTimeout("tcp", host, 1*time.Second)
+		// Fast TCP socket dial
+		conn, tcpErr := net.DialTimeout("tcp", host, 1*time.Second)
 		latency := time.Since(start).Milliseconds()
 
-		if err == nil {
+		isOnline := false
+		status := StatusHealthy
+		msg := ""
+
+		if tcpErr == nil {
 			conn.Close()
 			isOnline = true
-		} else {
-			// 2. Try HTTP check if TCP failed
-			checkURL := target.URL + target.HealthPath
-			resp, httpErr := h.client.Get(checkURL)
-			if httpErr == nil {
-				resp.Body.Close()
-				if resp.StatusCode < 500 {
-					isOnline = true
+
+			// If specific HTTP endpoint requested, probe it
+			if target.HealthPath != "" && target.HealthPath != "tcp" {
+				checkURL := target.URL + target.HealthPath
+				req, err := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
+				if err == nil {
+					resp, httpErr := h.client.Do(req)
+					if httpErr == nil {
+						resp.Body.Close()
+						if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+							status = StatusHealthy
+						} else if resp.StatusCode == http.StatusNotFound {
+							// 404 means route does not exist, but service port is active
+							status = StatusUnknown
+							msg = "TCP alive; health path returned 404"
+						} else if resp.StatusCode >= 500 {
+							status = StatusDegraded
+							msg = "Health path returned 5xx"
+						}
+					}
 				}
 			}
+		} else {
+			// TCP dial failed completely
+			isOnline = false
+			status = StatusUnhealthy
+			msg = tcpErr.Error()
 		}
 
 		h.mu.Lock()
 		wasState := target.Healthy
 		target.LastChecked = time.Now()
 		target.LatencyMs = latency
+		target.Status = status
+		target.Message = msg
 
 		if isOnline {
 			target.ConsecutiveFails = 0
 			target.Healthy = true
 		} else {
 			target.ConsecutiveFails++
-			if target.ConsecutiveFails >= 2 {
+			if target.ConsecutiveFails >= 3 {
 				target.Healthy = false
 			}
 		}
@@ -216,9 +285,4 @@ func (h *HealthMonitor) probeAll() {
 			h.onStatusChange(snapshot)
 		}
 	}
-}
-
-func hasPort(host string) bool {
-	_, _, err := net.SplitHostPort(host)
-	return err == nil
 }

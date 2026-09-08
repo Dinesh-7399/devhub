@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -18,9 +17,6 @@ import (
 )
 
 func TestFullSupervisorIntegration(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	// Upstream API mock
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -35,12 +31,7 @@ func TestFullSupervisorIntegration(t *testing.T) {
 	r.Add("/auth", uURL, false)
 
 	ring := buffer.NewRingBuffer(20)
-	hub := newHub()
-	go hub.run(ctx)
-
-	engine := proxy.NewEngine(r, ring, func(ev buffer.TraceEvent) {
-		hub.broadcastJSON(ev)
-	})
+	engine := proxy.NewEngine(r, ring, func(ev buffer.TraceEvent) {})
 	engine.Health.RegisterTarget(uURL, "/health")
 
 	// Dashboard Mux

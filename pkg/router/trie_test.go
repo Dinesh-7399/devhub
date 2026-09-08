@@ -129,6 +129,44 @@ func TestRouter_Concurrent(t *testing.T) {
 	wg.Wait()
 }
 
+func TestRouter_Remove(t *testing.T) {
+	r := NewRouter()
+	r.Add("/api/v1/users", mustParseURL("http://localhost:5003"), true)
+	r.Add("/api/v1/orders", mustParseURL("http://localhost:5004"), true)
+	r.Add("/auth", mustParseURL("http://localhost:5001"), false)
+
+	// Verify initial match
+	if _, _, matched := r.Match("/api/v1/users/42"); !matched {
+		t.Fatalf("expected initial match for users")
+	}
+
+	// Remove /api/v1/users
+	removed := r.Remove("/api/v1/users")
+	if !removed {
+		t.Fatalf("expected Remove to return true")
+	}
+
+	// Users should not match now
+	if _, _, matched := r.Match("/api/v1/users/42"); matched {
+		t.Fatalf("expected /api/v1/users to be unmounted")
+	}
+
+	// Sibling route /api/v1/orders MUST still match!
+	if target, _, matched := r.Match("/api/v1/orders/101"); !matched || target.Target.Host != "localhost:5004" {
+		t.Fatalf("expected sibling /api/v1/orders to still match")
+	}
+
+	// Auth must still match
+	if target, _, matched := r.Match("/auth/login"); !matched || target.Target.Host != "localhost:5001" {
+		t.Fatalf("expected /auth to still match")
+	}
+
+	// Removing nonexistent route should return false
+	if r.Remove("/api/nonexistent") {
+		t.Fatalf("expected Remove of nonexistent route to return false")
+	}
+}
+
 func BenchmarkRouter_Match(b *testing.B) {
 	r := NewRouter()
 	r.Add("/api/v1/users", mustParseURL("http://localhost:5003"), true)

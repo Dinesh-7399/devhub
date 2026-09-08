@@ -18,16 +18,16 @@ DevHub is an industrial-grade developer platform that combines the capabilities 
 
 ## 🚀 Core Features
 
-- **⚡ Zero-Allocation L7 Reverse Proxy:** Segment-aware Longest-Prefix Matching router using **100% Lock-Free RCU Atomic Pointers** (`atomic.Pointer[TrieNode]`), benchmarking at **170M+ ops/s** with $0\text{ B/op}$ and $0\text{ allocs/op}$.
-- **🔀 Dual Ingress & Egress Forward Proxy:** Serves as an Ingress Gateway (`:4000`) and an Egress Forward Proxy (`HTTP_PROXY=http://localhost:4000`), enabling **100% Zero-Code Downstream Cascading (`Service A -> Service B`)**.
-- **🐳 Cross-Platform Docker Auto-Discovery:** Native Windows Named Pipe (`\\.\pipe\docker_engine`) and Unix Domain Socket (`/var/run/docker.sock`) clients with automatic label inspection and dynamic route mounting.
+- **⚡ Zero-Allocation L7 Reverse Proxy:** Segment-aware Longest-Prefix Matching router using persistent path-copying with atomic pointer swap (`atomic.Pointer[TrieNode]`), benchmarking at **54M+ ops/s** with $0\text{ B/op}$ and $0\text{ allocs/op}$ on lookups, supporting dynamic concurrent `Add()` and `Remove()`.
+- **🔀 Dual Ingress & Streaming Forward Proxy:** Serves as an Ingress Gateway (`:4000`) and an Egress Forward Proxy (`HTTP_PROXY=http://localhost:4000`), enabling zero-code downstream cascading (`Service A -> Service B`). Features bounded 64KB tee-capture with per-chunk `http.Flusher` (zero memory bloat for multi-GB payloads, instant LLM/SSE tokens) and isolated `Proxy: nil` transport loops.
+- **🔒 Hardened Developer Cockpit:** Bound securely to `127.0.0.1` by default with strict WebSocket origin verification, optional token authentication (`dashboard_auth_token`), 1-click replay composer, and live cURL export.
+- **🐳 Cross-Platform Docker Auto-Discovery:** Native Windows Named Pipe (`\\.\pipe\docker_engine`) and Unix Domain Socket (`/var/run/docker.sock`) clients with deterministic label-based routing and automatic route teardown on container shutdown.
 - **📜 8-Byte Stream Demuxer:** High-performance binary demultiplexer for Docker's multiplexed container logs (`stdout` vs `stderr`).
 - **🪝 Webhook HMAC Re-Signer & Bypass:** Automatically recalculates cryptographic HMAC signatures (`Stripe-Signature`, `X-Hub-Signature-256`, `X-Razorpay-Signature`, `X-Shopify-Hmac-Sha256`, `X-Slack-Signature`) when payloads are edited in the replay composer.
 - **🎭 Mock Mode Fallback:** Instant 200 OK mock response interceptor (`always` or `on_error`) to unblock frontend developers when downstream microservices are down or in development.
-- **💓 Live Upstream Health Probing:** Background TCP and HTTP liveness probes (every 3s) with real-time green/red heartbeat indicators.
-- **⚡ Transparent WebSocket & SSE Tunneling:** Full-duplex non-blocking connection hijacking for WebSockets and immediate flushing (`http.Flusher`) for LLM/audio streaming (Whisper, GenAI).
-- **🕵️ W3C Distributed Tracing & PII Redactor:** Automatic `traceparent` injection, causal Waterfall Gantt chart hierarchy, and regex scrubbing for tokens, passwords, API keys, and credit cards.
-- **📊 Embedded Developer Cockpit:** Production dark-mode SPA served at `:4040` with live switchboard, 1-click request replay, cURL exporter, and container log console.
+- **💓 Passive Health Checks & Circuit Breaker:** Passive observation mode by default for resilient local developer flow, with an opt-in active circuit breaker (`enforce_circuit_breaker`) and TCP fallback.
+- **⚡ Scheme-Aware WebSocket & WSS Tunneling:** Full-duplex connection hijacking with scheme-aware dialing (`ws://` and `wss://` over TLS) and full connection lifecycle telemetry.
+- **🕵️ Recursive PII Redactor & Failure Observability:** AST-level JSON parsing and form-urlencoded scrubbing for credentials and credit cards, alongside guaranteed capture of 404, 502, and 503 gateway events.
 
 ---
 
@@ -37,8 +37,8 @@ Executed on Go 1.24+ (`windows/amd64`, 12th Gen Intel Core i5-1240P, 16 threads)
 
 | Subsystem | Benchmark Test | Throughput | Latency | Memory / Op | Allocations |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **RCU Trie Router** | `BenchmarkRouter_Match-16` | **170.77 Million ops/s** | **7.61 ns** | **0 B/op** | **0 allocs/op** |
-| **Ring Buffer** | `BenchmarkRingBuffer_Push-16` | **12.62 Million ops/s** | **92.97 ns** | **0 B/op** | **0 allocs/op** |
+| **Path-Copying Trie** | `BenchmarkRouter_Match-16` | **54.64 Million ops/s** | **20.79 ns** | **0 B/op** | **0 allocs/op** |
+| **Ring Buffer** | `BenchmarkRingBuffer_Push-16` | **10.25 Million ops/s** | **117.3 ns** | **0 B/op** | **0 allocs/op** |
 | **Full Reverse Proxy** | `BenchmarkEngine_ServeHTTP-16` | **5,898 req/s** | **0.20 ms** | *Pooled Stream* | *Tuned Pool* |
 
 ---

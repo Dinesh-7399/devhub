@@ -340,9 +340,25 @@ const DashboardHTML = `<!DOCTYPE html>
     var dockerConsoleEl = document.getElementById('docker-logs-console');
     var healthPillsEl = document.getElementById('health-pills');
 
+    var authToken = new URLSearchParams(window.location.search).get('token') || '';
+    if (authToken) {
+      var origFetch = window.fetch;
+      window.fetch = function(url, opts) {
+        opts = opts || {};
+        opts.headers = opts.headers || {};
+        if (opts.headers instanceof Headers) {
+          opts.headers.set('Authorization', 'Bearer ' + authToken);
+        } else {
+          opts.headers['Authorization'] = 'Bearer ' + authToken;
+        }
+        return origFetch(url, opts);
+      };
+    }
+
     function connectWS() {
       var proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      var ws = new WebSocket(proto + '//' + window.location.host + '/ws');
+      var wsUrl = proto + '//' + window.location.host + '/ws' + (authToken ? '?token=' + encodeURIComponent(authToken) : '');
+      var ws = new WebSocket(wsUrl);
 
       ws.onopen = function() {
         wsStatusEl.innerHTML = '<span class="h-2 w-2 rounded-full bg-emerald-500 animate-pulse"></span><span class="text-emerald-400 font-bold">Mesh Active</span>';

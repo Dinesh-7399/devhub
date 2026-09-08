@@ -73,6 +73,26 @@ func TestRedactor_HeadersAndBody(t *testing.T) {
 	if !strings.Contains(redactedBody, `"amount":100`) {
 		t.Errorf("non-sensitive field was corrupted: %s", redactedBody)
 	}
+
+	// Test Nested JSON
+	nestedJSON := `{"data":{"account":{"user":"bob","secret":"super-secret-nested-val"}},"tags":["admin"]}`
+	redactedNested := RedactBody(nestedJSON)
+	if strings.Contains(redactedNested, "super-secret-nested-val") {
+		t.Errorf("nested secret was not redacted: %s", redactedNested)
+	}
+	if !strings.Contains(redactedNested, "bob") || !strings.Contains(redactedNested, "admin") {
+		t.Errorf("non-sensitive fields in nested JSON corrupted: %s", redactedNested)
+	}
+
+	// Test Form-urlencoded
+	formBody := "username=alice&password=MyPlainPassword&grant_type=password"
+	redactedForm := RedactBody(formBody)
+	if strings.Contains(redactedForm, "MyPlainPassword") {
+		t.Errorf("password in form-urlencoded body was not redacted: %s", redactedForm)
+	}
+	if !strings.Contains(redactedForm, "username=alice") {
+		t.Errorf("non-sensitive field in form body corrupted: %s", redactedForm)
+	}
 }
 
 func TestWaterfall_Build(t *testing.T) {

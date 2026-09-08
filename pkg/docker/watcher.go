@@ -61,7 +61,7 @@ func (w *Watcher) Start(ctx context.Context) error {
 	return nil
 }
 
-// syncContainers scans all running containers and mounts routes for matching labels.
+// syncContainers scans all running containers, mounts active routes, and unmounts stale ones.
 func (w *Watcher) syncContainers(ctx context.Context) error {
 	if w.client == nil {
 		return nil
@@ -71,9 +71,26 @@ func (w *Watcher) syncContainers(ctx context.Context) error {
 		return err
 	}
 
+	activeIDs := make(map[string]bool, len(containers))
 	for _, c := range containers {
+		activeIDs[c.ID] = true
 		w.registerContainer(ctx, c)
 	}
+
+	// Reconcile: identify any routes for containers that are no longer active
+	w.mu.RLock()
+	var deadIDs []string
+	for id := range w.routes {
+		if !activeIDs[id] {
+			deadIDs = append(deadIDs, id)
+		}
+	}
+	w.mu.RUnlock()
+
+	for _, deadID := range deadIDs {
+		w.unregisterContainer(deadID)
+	}
+
 	return nil
 }
 
@@ -160,7 +177,8 @@ func (w *Watcher) unregisterContainer(containerID string) {
 	w.mu.Unlock()
 
 	if exists {
-		fmt.Printf("🐳 [Docker Discovery] Unmounted route for dead container %s\n", cRoute.Name)
+		w.router.Remove(cRoute.Prefix)
+		fmt.Printf("🐳 [Docker Discovery] Unmounted route for dead container %s (%s)\n", cRoute.Name, cRoute.Prefix)
 		if w.onRoute != nil {
 			w.onRoute("unmount", cRoute)
 		}
@@ -248,6 +266,7 @@ func (w *Watcher) eventLoop(ctx context.Context) {
 		}
 		stream.Close()
 		time.Sleep(1 * time.Second)
+		_ = w.syncContainers(ctx)
 	}
 }
 
