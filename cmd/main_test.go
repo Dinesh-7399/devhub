@@ -138,3 +138,35 @@ func TestReplayHandler_WebhookResigning(t *testing.T) {
 		t.Errorf("expected Stripe-Signature with t= and v1=, got %s", capturedStripeHeader)
 	}
 }
+
+func TestIsAuthorizedDashboardRequest(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	req.Header.Set("Authorization", "Token test-token")
+	if !isAuthorizedDashboardRequest(req, "test-token") {
+		t.Fatalf("expected bearer token to authorize request")
+	}
+
+	req2 := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	req2.Header.Set("X-DevHub-Token", "alt-token")
+	if !isAuthorizedDashboardRequest(req2, "alt-token") {
+		t.Fatalf("expected X-DevHub-Token to authorize request")
+	}
+}
+
+func TestIsAllowedDashboardOrigin_Defaults(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+	req.Header.Set("Origin", "http://localhost:4040")
+	if !isAllowedDashboardOrigin(req, nil) {
+		t.Fatalf("expected localhost origin to be allowed by default")
+	}
+
+	req.Header.Set("Origin", "https://evil.example")
+	if isAllowedDashboardOrigin(req, nil) {
+		t.Fatalf("expected non-local origin to be blocked by default")
+	}
+
+	req.Header.Set("Origin", "https://dash.example")
+	if !isAllowedDashboardOrigin(req, []string{"https://dash.example"}) {
+		t.Fatalf("expected explicitly allowed origin to pass")
+	}
+}

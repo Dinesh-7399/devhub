@@ -348,3 +348,72 @@ func TestEngine_CircuitBreaker(t *testing.T) {
 		t.Errorf("expected circuit breaker 503, got %d", rec.Code)
 	}
 }
+
+func TestEngine_ForwardProxy_LargeStreamingCaptureCapped(t *testing.T) {
+	payloadSize := 256 * 1024
+	largeReq := bytes.Repeat([]byte("R"), payloadSize)
+	largeResp := bytes.Repeat([]byte("S"), payloadSize)
+
+	var downstreamReceivedLen int
+	downstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		downstreamReceivedLen = len(b)
+		w.WriteHeader(http.StatusOK)
+		w.Write(largeResp)
+	}))
+	defer downstream.Close()
+
+	ring := buffer.NewRingBuffer(10)
+	engine := NewEngine(router.NewRouter(), ring, nil)
+	proxyServer := httptest.NewServer(engine)
+	defer proxyServer.Close()
+
+	proxyURL, _ := url.Parse(proxyServer.URL)
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, downstream.URL+"/bulk", bytes.NewReader(largeReq))
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("forward proxy request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if downstreamReceivedLen != payloadSize {
+		t.Fatalf("expected downstream to receive %d bytes, got %d", payloadSize, downstreamReceivedLen)
+	}
+	if len(body) != payloadSize {
+		t.Fatalf("expected streamed response size %d, got %d", payloadSize, len(body))
+	}
+
+	events := ring.GetAll()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if len(events[0].RequestBody) != maxCaptureSize {
+		t.Fatalf("expected request capture to cap at %d, got %d", maxCaptureSize, len(events[0].RequestBody))
+	}
+	if len(events[0].ResponseBody) != maxCaptureSize {
+		t.Fatalf("expected response capture to cap at %d, got %d", maxCaptureSize, len(events[0].ResponseBody))
+	}
+}
+
+func TestEngine_ConnectTunnel_BlocksPrivateByDefault(t *testing.T) {
+	engine := NewEngine(router.NewRouter(), buffer.NewRingBuffer(2), nil)
+	rec := httptest.NewRecorder()
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Host: "127.0.0.1:443"},
+		Host:   "127.0.0.1:443",
+		Header: make(http.Header),
+	}
+
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for blocked CONNECT target, got %d", rec.Code)
+	}
+}

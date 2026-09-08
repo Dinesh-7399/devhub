@@ -19,6 +19,7 @@ type Config struct {
 	Docker    DockerConfig              `yaml:"docker"`
 	Tunnel    TunnelConfig              `yaml:"tunnel"`
 	Tracing   TracingConfig             `yaml:"tracing"`
+	Security  SecurityConfig            `yaml:"security"`
 	Routes    []RouteConfig             `yaml:"routes"`
 	Overrides map[string]OverrideConfig `yaml:"overrides"`
 }
@@ -66,6 +67,15 @@ type TracingConfig struct {
 	RingSize  int  `yaml:"ring_size"`
 }
 
+// SecurityConfig controls dashboard auth/origins and egress restrictions.
+type SecurityConfig struct {
+	AuthToken         string   `yaml:"auth_token"`
+	AllowedEgressHost []string `yaml:"allowed_egress_hosts"`
+	AllowPrivateEgress bool    `yaml:"allow_private_egress"`
+	AllowedOrigins    []string `yaml:"allowed_origins"`
+	DashboardBind     string   `yaml:"dashboard_bind"`
+}
+
 // RouteConfig defines a static path route.
 type RouteConfig struct {
 	Prefix          string `yaml:"prefix"`
@@ -104,6 +114,9 @@ func DefaultConfig() *Config {
 			Enabled:   true,
 			RedactPII: true,
 			RingSize:  500,
+		},
+		Security: SecurityConfig{
+			DashboardBind: "127.0.0.1",
 		},
 		Overrides: make(map[string]OverrideConfig),
 		Routes: []RouteConfig{
@@ -221,6 +234,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.Server.DashboardPort <= 0 {
 		cfg.Server.DashboardPort = 4040
+	}
+	if strings.TrimSpace(cfg.Security.DashboardBind) == "" {
+		cfg.Security.DashboardBind = "127.0.0.1"
 	}
 
 	return cfg, nil
