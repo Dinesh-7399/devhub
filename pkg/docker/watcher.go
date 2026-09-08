@@ -26,25 +26,34 @@ type ContainerRoute struct {
 
 // Watcher supervises Docker container lifecycle and maps routes automatically.
 type Watcher struct {
-	client     *Client
-	router     *router.Router
-	mu         sync.RWMutex
-	routes     map[string]*ContainerRoute
-	logStreams map[string]context.CancelFunc
-	onLog      func(entry LogEntry)
-	onRoute    func(action string, r *ContainerRoute)
+	client       *Client
+	router       *router.Router
+	autoRouteAll bool
+	mu           sync.RWMutex
+	routes       map[string]*ContainerRoute
+	logStreams   map[string]context.CancelFunc
+	onLog        func(entry LogEntry)
+	onRoute      func(action string, r *ContainerRoute)
 }
 
 // NewWatcher initializes a container discovery watcher.
 func NewWatcher(client *Client, r *router.Router, onLog func(LogEntry), onRoute func(string, *ContainerRoute)) *Watcher {
 	return &Watcher{
-		client:     client,
-		router:     r,
-		routes:     make(map[string]*ContainerRoute),
-		logStreams: make(map[string]context.CancelFunc),
-		onLog:      onLog,
-		onRoute:    onRoute,
+		client:       client,
+		router:       r,
+		autoRouteAll: false, // Strict opt-in devhub.route label required by default
+		routes:       make(map[string]*ContainerRoute),
+		logStreams:   make(map[string]context.CancelFunc),
+		onLog:        onLog,
+		onRoute:      onRoute,
 	}
+}
+
+// SetAutoRouteAll controls whether unlabeled containers should be automatically routed by container name.
+func (w *Watcher) SetAutoRouteAll(enable bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.autoRouteAll = enable
 }
 
 // Start begins initial discovery and long-running event listening.
@@ -105,11 +114,14 @@ func (w *Watcher) registerContainer(ctx context.Context, c ContainerInfo) {
 	if routePrefix == "" && len(c.Names) > 0 {
 		cleanName := strings.TrimPrefix(c.Names[0], "/")
 		if cleanName != "" && !strings.HasPrefix(cleanName, "devhub") {
-			// Auto-route by container name e.g. /service-name
-			routePrefix = "/" + cleanName
+			// Strict opt-in: only route unlabeled containers if devhub.enable is true OR autoRouteAll is set
+			if c.Labels["devhub.enable"] == "true" || w.autoRouteAll {
+				routePrefix = "/" + cleanName
+			}
 		}
 	}
 
+	// Container is not opted in or has no route prefix
 	if routePrefix == "" {
 		return
 	}
@@ -149,8 +161,21 @@ func (w *Watcher) registerContainer(ctx context.Context, c ContainerInfo) {
 		Port:        targetPort,
 	}
 
+	// Idempotency check: if container already registered and route parameters are unchanged, skip tree update
 	w.mu.Lock()
+	existing, exists := w.routes[c.ID]
+	if exists {
+		if existing.Prefix == routePrefix && existing.Target.String() == targetURL.String() && existing.StripPrefix == stripPrefix {
+			w.mu.Unlock()
+			return // Idempotent: completely unchanged
+		}
+		// Prefix changed: prune the old route first
+		if existing.Prefix != routePrefix {
+			w.router.Remove(existing.Prefix)
+		}
+	}
 	w.routes[c.ID] = cRoute
+	_, logStreaming := w.logStreams[c.ID]
 	w.mu.Unlock()
 
 	w.router.Add(routePrefix, targetURL, stripPrefix)
@@ -160,8 +185,10 @@ func (w *Watcher) registerContainer(ctx context.Context, c ContainerInfo) {
 		w.onRoute("mount", cRoute)
 	}
 
-	// Start live log streaming for container
-	w.startLogStream(ctx, c.ID, name)
+	// Start live log streaming for container only if not already active
+	if !logStreaming {
+		w.startLogStream(ctx, c.ID, name)
+	}
 }
 
 func (w *Watcher) unregisterContainer(containerID string) {

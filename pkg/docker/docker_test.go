@@ -100,3 +100,51 @@ func TestWatcher_RegisterContainerLabels(t *testing.T) {
 		t.Errorf("expected 0 active routes after unregister")
 	}
 }
+
+func TestWatcher_OptInAndIdempotency(t *testing.T) {
+	r := router.NewRouter()
+	mountCount := 0
+	watcher := NewWatcher(nil, r, nil, func(action string, cr *ContainerRoute) {
+		if action == "mount" {
+			mountCount++
+		}
+	})
+
+	// 1. Unlabeled container with autoRouteAll = false (default) should NOT be registered
+	unlabeled := ContainerInfo{
+		ID:    "unlabeled-1",
+		Names: []string{"/arbitrary-redis"},
+		Ports: []ContainerPort{{PrivatePort: 6379}},
+	}
+	watcher.registerContainer(context.Background(), unlabeled)
+	if len(watcher.GetRoutes()) != 0 {
+		t.Errorf("expected unlabeled container to be ignored by default, got %d routes", len(watcher.GetRoutes()))
+	}
+	if mountCount != 0 {
+		t.Errorf("expected 0 mounts, got %d", mountCount)
+	}
+
+	// 2. Opt-in container with devhub.route
+	labeled := ContainerInfo{
+		ID:    "orders-svc-1",
+		Names: []string{"/orders-service"},
+		Labels: map[string]string{
+			"devhub.route": "/api/orders",
+			"devhub.port":  "9000",
+		},
+		Ports: []ContainerPort{{PrivatePort: 9000}},
+	}
+	watcher.registerContainer(context.Background(), labeled)
+	if len(watcher.GetRoutes()) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(watcher.GetRoutes()))
+	}
+	if mountCount != 1 {
+		t.Errorf("expected exactly 1 mount, got %d", mountCount)
+	}
+
+	// 3. Idempotent re-sync with unchanged container should NOT re-mount or call router.Add
+	watcher.registerContainer(context.Background(), labeled)
+	if mountCount != 1 {
+		t.Errorf("reconciliation should be idempotent! expected mountCount 1, got %d", mountCount)
+	}
+}

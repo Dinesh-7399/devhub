@@ -215,65 +215,79 @@ func (h *HealthMonitor) probeAll(ctx context.Context) {
 		}
 
 		start := time.Now()
-		host := target.Host
-		if !hasPort(host) {
-			host = host + ":80"
-		}
+		var isSuccess bool
+		var status string
+		var msg string
 
-		// Fast TCP socket dial
-		conn, tcpErr := net.DialTimeout("tcp", host, 1*time.Second)
-		latency := time.Since(start).Milliseconds()
-
-		isOnline := false
-		status := StatusHealthy
-		msg := ""
-
-		if tcpErr == nil {
-			conn.Close()
-			isOnline = true
-
-			// If specific HTTP endpoint requested, probe it
-			if target.HealthPath != "" && target.HealthPath != "tcp" {
-				checkURL := target.URL + target.HealthPath
-				req, err := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
-				if err == nil {
-					resp, httpErr := h.client.Do(req)
-					if httpErr == nil {
-						resp.Body.Close()
-						if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-							status = StatusHealthy
-						} else if resp.StatusCode == http.StatusNotFound {
-							// 404 means route does not exist, but service port is active
-							status = StatusUnknown
-							msg = "TCP alive; health path returned 404"
-						} else if resp.StatusCode >= 500 {
-							status = StatusDegraded
-							msg = "Health path returned 5xx"
-						}
+		if target.HealthPath != "" && target.HealthPath != "tcp" {
+			// Direct HTTP Health Probe (no redundant TCP pre-probe)
+			checkURL := target.URL + target.HealthPath
+			req, err := http.NewRequestWithContext(ctx, "GET", checkURL, nil)
+			if err != nil {
+				isSuccess = false
+				status = StatusDegraded
+				msg = err.Error()
+			} else {
+				resp, httpErr := h.client.Do(req)
+				if httpErr != nil {
+					isSuccess = false
+					status = StatusDegraded
+					msg = httpErr.Error()
+				} else {
+					resp.Body.Close()
+					if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+						isSuccess = true
+						status = StatusHealthy
+					} else if resp.StatusCode == http.StatusNotFound {
+						// 404 means service is alive, but specific health path is not mapped
+						isSuccess = true
+						status = StatusUnknown
+						msg = "Service port active; health path returned 404"
+					} else {
+						// 5xx or error code
+						isSuccess = false
+						status = StatusDegraded
+						msg = http.StatusText(resp.StatusCode)
 					}
 				}
 			}
 		} else {
-			// TCP dial failed completely
-			isOnline = false
-			status = StatusUnhealthy
-			msg = tcpErr.Error()
+			// TCP Socket Liveness Probe for targets without dedicated HTTP health paths
+			host := target.Host
+			if !hasPort(host) {
+				host = host + ":80"
+			}
+			conn, tcpErr := net.DialTimeout("tcp", host, 1*time.Second)
+			if tcpErr == nil {
+				conn.Close()
+				isSuccess = true
+				status = StatusHealthy
+			} else {
+				isSuccess = false
+				status = StatusDegraded
+				msg = tcpErr.Error()
+			}
 		}
+
+		latency := time.Since(start).Milliseconds()
 
 		h.mu.Lock()
 		wasState := target.Healthy
 		target.LastChecked = time.Now()
 		target.LatencyMs = latency
-		target.Status = status
 		target.Message = msg
 
-		if isOnline {
+		if isSuccess {
 			target.ConsecutiveFails = 0
 			target.Healthy = true
+			target.Status = status
 		} else {
 			target.ConsecutiveFails++
 			if target.ConsecutiveFails >= 3 {
 				target.Healthy = false
+				target.Status = StatusUnhealthy
+			} else {
+				target.Status = StatusDegraded
 			}
 		}
 

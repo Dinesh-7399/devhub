@@ -42,16 +42,18 @@ type ServerConfig struct {
 	DashboardPort         int    `yaml:"dashboard_port"`
 	Host                  string `yaml:"host"`
 	DashboardHost         string `yaml:"dashboard_host"`
-	DashboardAuthToken    string `yaml:"dashboard_auth_token"`
-	EnforceCircuitBreaker bool   `yaml:"enforce_circuit_breaker"`
+	DashboardAuthToken     string `yaml:"dashboard_auth_token"`
+	EnforceCircuitBreaker  bool   `yaml:"enforce_circuit_breaker"`
+	BlockMetadataEndpoints bool   `yaml:"block_metadata_endpoints"`
 }
 
 // DockerConfig configures Docker Engine auto-discovery.
 type DockerConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	SocketPath string `yaml:"socket_path"`
-	Network    string `yaml:"network"`
-	PollLogs   bool   `yaml:"poll_logs"`
+	Enabled      bool   `yaml:"enabled"`
+	SocketPath   string `yaml:"socket_path"`
+	Network      string `yaml:"network"`
+	PollLogs     bool   `yaml:"poll_logs"`
+	AutoRouteAll bool   `yaml:"auto_route_all"`
 }
 
 // TunnelConfig configures public ingress tunneling.
@@ -62,11 +64,12 @@ type TunnelConfig struct {
 	AuthToken string `yaml:"auth_token"`
 }
 
-// TracingConfig controls W3C distributed tracing and PII redaction.
+// TracingConfig controls W3C distributed tracing, PII redaction, and telemetry buffer policies.
 type TracingConfig struct {
-	Enabled   bool `yaml:"enabled"`
-	RedactPII bool `yaml:"redact_pii"`
-	RingSize  int  `yaml:"ring_size"`
+	Enabled        bool   `yaml:"enabled"`
+	RedactPII      bool   `yaml:"redact_pii"`
+	RingSize       int    `yaml:"ring_size"`
+	OverflowPolicy string `yaml:"overflow_policy"` // "drop" or "block"
 }
 
 // RouteConfig defines a static path route.
@@ -105,26 +108,29 @@ func DefaultConfig() *Config {
 	return &Config{
 		Version: "1.0",
 		Server: ServerConfig{
-			ProxyPort:             4000,
-			DashboardPort:         4040,
-			Host:                  "0.0.0.0",
-			DashboardHost:         "127.0.0.1", // Secure localhost binding by default
-			DashboardAuthToken:    "",
-			EnforceCircuitBreaker: false, // Passive health observation by default
+			ProxyPort:              4000,
+			DashboardPort:          4040,
+			Host:                   "0.0.0.0",
+			DashboardHost:          "127.0.0.1", // Secure localhost binding by default
+			DashboardAuthToken:     "",
+			EnforceCircuitBreaker:  false, // Passive health observation by default
+			BlockMetadataEndpoints: true,  // Block cloud metadata SSRF by default
 		},
 		Docker: DockerConfig{
-			Enabled:    true,
-			SocketPath: defaultDockerSocket,
-			PollLogs:   true,
+			Enabled:      true,
+			SocketPath:   defaultDockerSocket,
+			PollLogs:     true,
+			AutoRouteAll: false, // Strict opt-in devhub.route label required by default
 		},
 		Tunnel: TunnelConfig{
 			Enabled:   false,
 			ServerURL: "wss://relay.devhub.live/tunnel",
 		},
 		Tracing: TracingConfig{
-			Enabled:   true,
-			RedactPII: true,
-			RingSize:  500,
+			Enabled:        true,
+			RedactPII:      true,
+			RingSize:       500,
+			OverflowPolicy: "drop",
 		},
 		Overrides: make(map[string]OverrideConfig),
 		Routes: []RouteConfig{

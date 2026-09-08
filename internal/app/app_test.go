@@ -178,3 +178,77 @@ func TestApp_TelemetryEventChannel(t *testing.T) {
 		}
 	}
 }
+
+func TestApp_TicketAuthAndTelemetryStats(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			ProxyPort:          19007,
+			DashboardPort:      19008,
+			DashboardHost:      "127.0.0.1",
+			DashboardAuthToken: "admintoken456",
+		},
+	}
+
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("failed to create app: %v", err)
+	}
+
+	dashMux := http.NewServeMux()
+	app.setupDashboardRoutes(dashMux)
+	dashServer := httptest.NewServer(dashMux)
+	defer dashServer.Close()
+
+	// 1. Get Ticket with Auth
+	ticketReq, _ := http.NewRequest(http.MethodGet, dashServer.URL+"/api/auth/ticket", nil)
+	ticketReq.Header.Set("Authorization", "Bearer admintoken456")
+	res, err := dashServer.Client().Do(ticketReq)
+	if err != nil {
+		t.Fatalf("ticket request failed: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for ticket, got %d", res.StatusCode)
+	}
+
+	var ticketData map[string]string
+	json.NewDecoder(res.Body).Decode(&ticketData)
+	ticket := ticketData["ticket"]
+	if ticket == "" {
+		t.Fatalf("expected non-empty ticket")
+	}
+
+	// Verify ticket stored in tickets map
+	app.ticketMu.Lock()
+	expiry, exists := app.tickets[ticket]
+	app.ticketMu.Unlock()
+	if !exists || time.Now().After(expiry) {
+		t.Errorf("expected valid ticket stored in memory")
+	}
+
+	// 2. Query Telemetry Stats
+	statsReq, _ := http.NewRequest(http.MethodGet, dashServer.URL+"/api/telemetry/stats", nil)
+	statsReq.Header.Set("Authorization", "Bearer admintoken456")
+	res2, err := dashServer.Client().Do(statsReq)
+	if err != nil {
+		t.Fatalf("stats request failed: %v", err)
+	}
+	defer res2.Body.Close()
+
+	if res2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 for stats, got %d", res2.StatusCode)
+	}
+
+	var stats map[string]any
+	json.NewDecoder(res2.Body).Decode(&stats)
+	if _, ok := stats["total_events"]; !ok {
+		t.Errorf("expected total_events in stats")
+	}
+	if _, ok := stats["dropped_events"]; !ok {
+		t.Errorf("expected dropped_events in stats")
+	}
+	if capVal, ok := stats["queue_capacity"].(float64); !ok || capVal != 4096 {
+		t.Errorf("expected queue_capacity 4096, got %v", stats["queue_capacity"])
+	}
+}

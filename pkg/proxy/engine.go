@@ -86,6 +86,7 @@ type Engine struct {
 	HTTPProxy        *httputil.ReverseProxy
 	Transport        http.RoundTripper // Ingress transport (no env proxy recursion)
 	ForwardTransport http.RoundTripper // Egress forward proxy transport
+	SecurityPolicy   *EgressSecurityPolicy
 	RedactPII        bool
 }
 
@@ -93,6 +94,7 @@ type Engine struct {
 func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffer.TraceEvent)) *Engine {
 	health := NewHealthMonitor()
 	mocks := mock.NewManager()
+	secPolicy := NewEgressSecurityPolicy(true) // Block cloud metadata SSRF by default
 
 	// Ingress transport: explicitly Proxy: nil to prevent recursion if HTTP_PROXY is set
 	ingressTransport := &http.Transport{
@@ -111,13 +113,20 @@ func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffe
 		DisableCompression:    true, // pass raw stream chunks without re-compression CPU penalty
 	}
 
-	// Forward transport: separate client transport with Proxy: nil (no self-referential loop)
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	// Forward transport: separate client transport with Proxy: nil and SSRF destination validation
 	forwardTransport := &http.Transport{
 		Proxy: nil,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if err := secPolicy.ValidateDestination(addr); err != nil {
+				return nil, err
+			}
+			return dialer.DialContext(ctx, network, addr)
+		},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          10000,
 		MaxIdleConnsPerHost:   1000,
@@ -136,6 +145,7 @@ func NewEngine(r *router.Router, ring *buffer.RingBuffer, broadcaster func(buffe
 		Broadcast:        broadcaster,
 		Transport:        ingressTransport,
 		ForwardTransport: forwardTransport,
+		SecurityPolicy:   secPolicy,
 		RedactPII:        true,
 	}
 
@@ -511,6 +521,23 @@ func (e *Engine) handleForwardProxyHTTP(w http.ResponseWriter, req *http.Request
 
 // handleConnectTunnel handles HTTPS/TLS CONNECT forward proxy tunnels with full lifecycle duration tracking.
 func (e *Engine) handleConnectTunnel(w http.ResponseWriter, req *http.Request, start time.Time) {
+	// Validate destination against egress policy before hijacking or dialing
+	if e.SecurityPolicy != nil {
+		if err := e.SecurityPolicy.ValidateDestination(req.URL.Host); err != nil {
+			http.Error(w, fmt.Sprintf("Forbidden: %v", err), http.StatusForbidden)
+			e.emitTraceEvent(buffer.TraceEvent{
+				ID:         fastTraceID(),
+				Timestamp:  time.Now().Format("15:04:05.000"),
+				Method:     "CONNECT",
+				Path:       req.URL.Host,
+				Target:     "[Egress Blocked] " + req.URL.Host,
+				StatusCode: http.StatusForbidden,
+				DurationMs: time.Since(start).Milliseconds(),
+			})
+			return
+		}
+	}
+
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "CONNECT hijack unsupported", http.StatusInternalServerError)
@@ -646,9 +673,20 @@ func (e *Engine) proxyWebSocket(w http.ResponseWriter, req *http.Request, target
 	}
 	defer upstreamConn.Close()
 
-	// Forward upgrade handshake request to upstream
-	req.URL.Path = outboundPath
-	if err := req.Write(upstreamConn); err != nil {
+	// Forward upgrade handshake request to upstream with preserved query parameters and subprotocols
+	outboundReq := req.Clone(req.Context())
+	outboundReq.URL.Path = outboundPath
+	outboundReq.URL.RawQuery = req.URL.RawQuery
+	outboundReq.Host = targetURL.Host
+
+	if proto := req.Header.Get("Sec-WebSocket-Protocol"); proto != "" {
+		outboundReq.Header.Set("Sec-WebSocket-Protocol", proto)
+	}
+	if ext := req.Header.Get("Sec-WebSocket-Extensions"); ext != "" {
+		outboundReq.Header.Set("Sec-WebSocket-Extensions", ext)
+	}
+
+	if err := outboundReq.Write(upstreamConn); err != nil {
 		brw.WriteString("HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		brw.Flush()
 		return
@@ -656,7 +694,7 @@ func (e *Engine) proxyWebSocket(w http.ResponseWriter, req *http.Request, target
 
 	// Read and validate upstream handshake response
 	upstreamReader := bufio.NewReader(upstreamConn)
-	upstreamResp, err := http.ReadResponse(upstreamReader, req)
+	upstreamResp, err := http.ReadResponse(upstreamReader, outboundReq)
 	if err != nil {
 		brw.WriteString("HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		brw.Flush()

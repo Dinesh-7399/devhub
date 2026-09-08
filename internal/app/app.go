@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"devhub/pkg/buffer"
@@ -129,6 +132,10 @@ type App struct {
 	DashboardServer  *http.Server
 	Hub              *Hub
 	EventChan        chan buffer.TraceEvent // Decoupled asynchronous telemetry queue
+	EventsTotal      atomic.Uint64
+	EventsDropped    atomic.Uint64
+	ticketMu         sync.Mutex
+	tickets          map[string]time.Time
 	wg               sync.WaitGroup
 }
 
@@ -139,16 +146,42 @@ func New(cfg *config.Config) (*App, error) {
 	hub := newHub()
 	eventChan := make(chan buffer.TraceEvent, 4096)
 
+	app := &App{
+		Config:    cfg,
+		Router:    r,
+		Ring:      ring,
+		Hub:       hub,
+		EventChan: eventChan,
+		tickets:   make(map[string]time.Time),
+	}
+
+	overflowPolicy := cfg.Tracing.OverflowPolicy
+	if overflowPolicy == "" {
+		overflowPolicy = "drop"
+	}
+
 	// Decoupled telemetry worker: data plane pushes non-blocking to channel
 	engine := proxy.NewEngine(r, ring, func(ev buffer.TraceEvent) {
-		select {
-		case eventChan <- ev:
-		default:
-			// Non-blocking telemetry drop if queue fills under extreme stress
+		app.EventsTotal.Add(1)
+		if overflowPolicy == "block" {
+			select {
+			case eventChan <- ev:
+			case <-time.After(100 * time.Millisecond):
+				app.EventsDropped.Add(1)
+			}
+		} else {
+			select {
+			case eventChan <- ev:
+			default:
+				app.EventsDropped.Add(1)
+			}
 		}
 	})
 	engine.RedactPII = cfg.Tracing.RedactPII
 	engine.Health.SetCircuitBreakerEnforcement(cfg.Server.EnforceCircuitBreaker)
+	if engine.SecurityPolicy != nil {
+		engine.SecurityPolicy.BlockMetadata = cfg.Server.BlockMetadataEndpoints
+	}
 
 	// Hook health status updates into WebSocket hub
 	engine.Health.SetOnStatusChange(func(th proxy.TargetHealth) {
@@ -181,17 +214,10 @@ func New(cfg *config.Config) (*App, error) {
 
 	replayDispatcher := proxy.NewReplayDispatcher(engine)
 
-	app := &App{
-		Config:           cfg,
-		Router:           r,
-		Ring:             ring,
-		Health:           engine.Health,
-		Mocks:            engine.Mocks,
-		Engine:           engine,
-		ReplayDispatcher: replayDispatcher,
-		Hub:              hub,
-		EventChan:        eventChan,
-	}
+	app.Health = engine.Health
+	app.Mocks = engine.Mocks
+	app.Engine = engine
+	app.ReplayDispatcher = replayDispatcher
 
 	return app, nil
 }
@@ -235,6 +261,7 @@ func (a *App) Start(ctx context.Context) error {
 				}
 			}
 		})
+		a.DockerWatcher.SetAutoRouteAll(a.Config.Docker.AutoRouteAll)
 		_ = a.DockerWatcher.Start(ctx)
 	}
 
@@ -351,11 +378,52 @@ func (a *App) setupDashboardRoutes(mux *http.ServeMux) {
 		}
 	}
 
+	// Ticket endpoint: exchange bearer token for single-use short-lived (60s) WebSocket ticket
+	mux.HandleFunc("/api/auth/ticket", authMiddleware(func(w http.ResponseWriter, req *http.Request) {
+		b := make([]byte, 16)
+		_, _ = rand.Read(b)
+		ticket := hex.EncodeToString(b)
+
+		a.ticketMu.Lock()
+		a.tickets[ticket] = time.Now().Add(60 * time.Second)
+		a.ticketMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"ticket": ticket,
+		})
+	}))
+
 	// WebSocket Live Stream Hub
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, req *http.Request) {
 		token := a.Config.Server.DashboardAuthToken
 		if token != "" {
-			if req.URL.Query().Get("token") != token {
+			authorized := false
+			authHeader := req.Header.Get("Authorization")
+			if authHeader == "Bearer "+token {
+				authorized = true
+			}
+
+			// Validate single-use ticket
+			if !authorized {
+				ticket := req.URL.Query().Get("ticket")
+				if ticket != "" {
+					a.ticketMu.Lock()
+					expiry, exists := a.tickets[ticket]
+					if exists && time.Now().Before(expiry) {
+						delete(a.tickets, ticket) // Invalidate single-use ticket
+						authorized = true
+					}
+					a.ticketMu.Unlock()
+				}
+			}
+
+			// Fallback to token query param for backward compatibility
+			if !authorized && req.URL.Query().Get("token") == token {
+				authorized = true
+			}
+
+			if !authorized {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -405,6 +473,22 @@ func (a *App) setupDashboardRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/routes", authMiddleware(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(a.Config.Routes)
+	}))
+
+	// Telemetry Queue Stats & Drop Observability API
+	mux.HandleFunc("/api/telemetry/stats", authMiddleware(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		policy := a.Config.Tracing.OverflowPolicy
+		if policy == "" {
+			policy = "drop"
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"total_events":    a.EventsTotal.Load(),
+			"dropped_events":  a.EventsDropped.Load(),
+			"queue_depth":     len(a.EventChan),
+			"queue_capacity":  cap(a.EventChan),
+			"overflow_policy": policy,
+		})
 	}))
 
 	// Upstream Health Snapshot API
